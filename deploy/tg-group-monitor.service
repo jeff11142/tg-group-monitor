@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram 群組關鍵字監聽轉發
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成你 VPS 上實際的使用者與路徑
+User=ubuntu
+WorkingDirectory=/opt/tg-group-monitor
+ExecStart=/opt/tg-group-monitor/.venv/bin/python /opt/tg-group-monitor/main.py
+Restart=always
+RestartSec=10
+# 斷線/錯誤自動重啟；連續失敗也不放棄
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

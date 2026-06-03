@@ -65,3 +65,7 @@ nohup python main.py > monitor.log 2>&1 &
 ```
 
 之後若要做成開機自動啟動，可再加 `launchd`（macOS）設定。
+
+## 部署到 VPS（7×24 長期監聽）
+
+VPS 是無頭環境，無法手動輸驗證碼。流程是：**本機先登入產生 `.session` → scp 上傳 → VPS 用 systemd 掛背景**。完整步驟見 [deploy/DEPLOY.md](deploy/DEPLOY.md)，systemd 服務範本見 [deploy/tg-group-monitor.service](deploy/tg-group-monitor.service)。
