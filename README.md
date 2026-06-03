@@ -6,6 +6,15 @@
 
 > ⚠️ 這是以你個人帳號自動化登入（MTProto）。請遵守 Telegram 使用條款，僅用於你有權限存取的群組，避免大量爬取造成帳號被風控。
 
+## 不熟 Linux / 程式的人：看完整圖文教學
+
+從零開始（申請 TG API、建 Bot、本機跑通、VPS 部署、日常維運、常見問題排除）的逐步說明，選你的作業系統：
+
+- **Mac 使用者** → [docs/MAC_GUIDE.md](docs/MAC_GUIDE.md)
+- **Windows 使用者** → [docs/WINDOWS_GUIDE.md](docs/WINDOWS_GUIDE.md)
+
+底下的章節是給已經熟悉終端機 / Python / VPS 的人用的快速版。
+
 ## 安裝
 
 ```bash
