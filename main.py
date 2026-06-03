@@ -9,6 +9,7 @@ tg-group-monitor
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, timezone
 
 import httpx
@@ -56,6 +57,121 @@ def _matches(text: str) -> bool:
     return any(k in low for k in KEYWORDS)
 
 
+_SIG_SYMBOL = re.compile(r"#(\w+)")
+_SIG_VOL = re.compile(r"成交量排名[：:]\s*(\d+)\w*\s*/\s*(\d+)")
+_SIG_CAP = re.compile(r"市值[：:]\s*([\d.]+[KMB]?)")
+_SIG_RISK = re.compile(r"風險等級[：:]\s*([^\n]+)")
+_SIG_ENTRY = re.compile(r"進場價[：:]\s*([\d.]+)")
+_SIG_TP = re.compile(r"目標價\s*(\d+)\s*[：:]\s*([\d.]+)")
+_SIG_SL = re.compile(r"停損價\s*(\d+)\s*[：:]\s*([\d.]+)")
+_SIG_URL = re.compile(r"https?://\S+")
+
+_HIT_TP = re.compile(r"目標價\s*(\d+)\s*[：:]\s*([\d.]+)\s*✅")
+_HIT_SYMBOL = re.compile(r"#?(\b[A-Z][A-Z0-9_]{2,}\b)")
+
+
+def parse_signal(text: str) -> dict | None:
+    """嘗試把訊號訊息解析成結構化資料。沒命中 symbol+entry 就回 None（代表不是訊號）。"""
+    m_symbol = _SIG_SYMBOL.search(text)
+    m_entry = _SIG_ENTRY.search(text)
+    if not (m_symbol and m_entry):
+        return None
+
+    entry = float(m_entry.group(1))
+    signal: dict = {
+        "symbol": m_symbol.group(1),
+        "entry": entry,
+        "targets": [],
+        "stops": [],
+    }
+
+    if m := _SIG_VOL.search(text):
+        signal["volume_rank"] = f"{m.group(1)}/{m.group(2)}"
+    if m := _SIG_CAP.search(text):
+        signal["market_cap"] = m.group(1)
+    if m := _SIG_RISK.search(text):
+        signal["risk"] = m.group(1).strip()
+    if m := _SIG_URL.search(text):
+        signal["url"] = m.group(0)
+
+    for m in _SIG_TP.finditer(text):
+        price = float(m.group(2))
+        signal["targets"].append({
+            "level": int(m.group(1)),
+            "price": price,
+            "pct": round((price - entry) / entry * 100, 2),
+        })
+    for m in _SIG_SL.finditer(text):
+        price = float(m.group(2))
+        signal["stops"].append({
+            "level": int(m.group(1)),
+            "price": price,
+            "pct": round((price - entry) / entry * 100, 2),
+        })
+    return signal
+
+
+def format_signal(signal: dict, when: datetime) -> str:
+    """把結構化訊號格式化成自訂版面。"""
+    lines = [
+        f"⏰ {when.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"📊 幣別: {signal['symbol']}",
+    ]
+    if "risk" in signal:
+        lines.append(f"💡 風險: {signal['risk']}")
+
+    meta = []
+    if "volume_rank" in signal:
+        meta.append(f"24h成交量: {signal['volume_rank']}")
+    if "market_cap" in signal:
+        meta.append(f"市值: {signal['market_cap']}")
+    if meta:
+        lines.append("📈 " + " | ".join(meta))
+
+    lines.append("")
+    lines.append(f"➡️ 進場: {signal['entry']}")
+    for t in signal["targets"]:
+        sign = "+" if t["pct"] >= 0 else ""
+        lines.append(f"🎯 目標價{t['level']}: {t['price']} ({sign}{t['pct']}%)")
+
+    if signal["stops"]:
+        lines.append("")
+        for s in signal["stops"]:
+            sign = "+" if s["pct"] >= 0 else ""
+            lines.append(f"⛔ 停損價{s['level']}: {s['price']} ({sign}{s['pct']}%)")
+
+    if "url" in signal:
+        lines.append("")
+        lines.append(f"🔗 {signal['url']}")
+    return "\n".join(lines)
+
+
+def parse_target_hit(text: str) -> dict | None:
+    """嘗試解析「目標達成通知」（每個目標價後面帶 ✅）。沒有任何命中就回 None。"""
+    hits = [
+        {"level": int(m.group(1)), "price": float(m.group(2))}
+        for m in _HIT_TP.finditer(text)
+    ]
+    if not hits:
+        return None
+    m_symbol = _HIT_SYMBOL.search(text)
+    if not m_symbol:
+        return None
+    return {"symbol": m_symbol.group(1), "hits": hits}
+
+
+def format_target_hit(hit: dict, when: datetime) -> str:
+    """格式化目標達成通知：每個達成的目標自己一行，✅ 開頭。"""
+    lines = [
+        f"⏰ {when.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"📊 幣別: {hit['symbol']}",
+        "",
+    ]
+    for h in hit["hits"]:
+        lines.append(f"✅ 目標價{h['level']}: {h['price']}")
+    return "\n".join(lines)
+
+
 async def list_dialogs(client: TelegramClient) -> None:
     print("=== 你的對話清單（用下面的 id 填入 SOURCE_CHAT）===")
     async for dialog in client.iter_dialogs():
@@ -80,11 +196,11 @@ async def send_via_bot(http: httpx.AsyncClient, text: str) -> None:
 async def send_webhook(http: httpx.AsyncClient, payload: dict) -> None:
     try:
         if "discord.com/api/webhooks" in WEBHOOK_URL:
-            # Discord 需要 content 欄位
-            content = (
+            # Discord 需要 content 欄位：訊號用自訂格式，其他訊息退回原文
+            body = payload.get("formatted") or (
                 f"**{payload['sender']}** 於 {payload['chat']}\n{payload['text']}"
             )
-            await http.post(WEBHOOK_URL, json={"content": content[:1900]})
+            await http.post(WEBHOOK_URL, json={"content": body[:1900]})
         else:
             await http.post(WEBHOOK_URL, json=payload)
     except Exception as e:  # 不讓單次失敗中斷監聽
@@ -146,14 +262,27 @@ async def main() -> None:
         chat = await event.get_chat()
         chat_name = getattr(chat, "title", None) or str(event.chat_id)
 
+        now_local = datetime.now(timezone.utc).astimezone()
+        signal = parse_signal(text)
+        target_hit = None if signal else parse_target_hit(text)
+        if signal:
+            formatted = format_signal(signal, now_local)
+        elif target_hit:
+            formatted = format_target_hit(target_hit, now_local)
+        else:
+            formatted = None
+
         payload = {
-            "time": datetime.now(timezone.utc).astimezone().isoformat(),
+            "time": now_local.isoformat(),
             "chat": chat_name,
             "chat_id": event.chat_id,
             "sender": sender_name,
             "sender_id": getattr(sender, "id", None),
             "message_id": event.message.id,
             "text": text,
+            "signal": signal,
+            "target_hit": target_hit,
+            "formatted": formatted,
         }
 
         print(f"[命中] {payload['time']} {sender_name}: {text[:80]}")
@@ -161,9 +290,9 @@ async def main() -> None:
         if LOG_TO_FILE:
             write_log(payload)
 
-        # 用 Bot 轉發：你的帳號只監聽、不做任何發送動作
+        # 用 Bot 轉發：訊號訊息用自訂格式，其他訊息原樣轉發
         if BOT_TOKEN and BOT_TARGET:
-            await send_via_bot(http, text)
+            await send_via_bot(http, formatted or text)
 
         if WEBHOOK_URL:
             await send_webhook(http, payload)
