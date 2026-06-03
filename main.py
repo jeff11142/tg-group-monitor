@@ -29,6 +29,8 @@ SESSION_NAME = _get("SESSION_NAME", "tg_monitor")
 SOURCE_CHAT = _get("SOURCE_CHAT")
 KEYWORDS = [k.strip().lower() for k in _get("KEYWORDS").split(",") if k.strip()]
 FORWARD_TO = _get("FORWARD_TO")
+BOT_TOKEN = _get("BOT_TOKEN")
+BOT_TARGET = _get("BOT_TARGET")
 WEBHOOK_URL = _get("WEBHOOK_URL")
 LOG_TO_FILE = _get("LOG_TO_FILE", "1") == "1"
 LOG_FILE = _get("LOG_FILE", "messages.jsonl")
@@ -60,6 +62,20 @@ async def list_dialogs(client: TelegramClient) -> None:
     async for dialog in client.iter_dialogs():
         kind = "群組" if dialog.is_group else ("頻道" if dialog.is_channel else "私訊")
         print(f"[{kind}] {dialog.name!r}  id={dialog.id}")
+
+
+async def send_via_bot(http: httpx.AsyncClient, text: str) -> None:
+    """用 TG Bot 把訊息發到 BOT_TARGET（你的個人帳號不參與發送，降低風控風險）。"""
+    try:
+        resp = await http.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": BOT_TARGET, "text": text, "disable_web_page_preview": True},
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[bot 轉發失敗] {data.get('description')}")
+    except Exception as e:  # 不讓單次失敗中斷監聽
+        print(f"[bot 轉發失敗] {e}")
 
 
 async def send_webhook(http: httpx.AsyncClient, payload: dict) -> None:
@@ -110,9 +126,10 @@ async def main() -> None:
     forward_to = _parse_chat(FORWARD_TO)
     http = httpx.AsyncClient(timeout=10)
 
+    bot_status = f"開 → {BOT_TARGET}" if (BOT_TOKEN and BOT_TARGET) else "關"
     print(f"開始監聽：{SOURCE_CHAT}")
     print(f"關鍵字：{KEYWORDS or '（無，全部訊息）'}")
-    print(f"轉發 TG：{FORWARD_TO or '（關）'}  | Webhook：{'開' if WEBHOOK_URL else '關'}")
+    print(f"Bot 轉發：{bot_status}  | 個人帳號轉發：{FORWARD_TO or '關'}  | Webhook：{'開' if WEBHOOK_URL else '關'}")
 
     @client.on(events.NewMessage(chats=source))
     async def handler(event: events.NewMessage.Event) -> None:
@@ -146,6 +163,11 @@ async def main() -> None:
         if LOG_TO_FILE:
             write_log(payload)
 
+        # 用 Bot 轉發（推薦）：你的帳號不做發送動作
+        if BOT_TOKEN and BOT_TARGET:
+            await send_via_bot(http, text)
+
+        # 用個人帳號轉發（FORWARD_TO 有設才會發；與 Bot 轉發可二擇一或併用）
         if forward_to is not None:
             try:
                 await client.send_message(forward_to, text)
