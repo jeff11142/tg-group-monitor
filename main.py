@@ -118,7 +118,7 @@ def format_signal(signal: dict, when: datetime) -> str:
     """把結構化訊號格式化成自訂版面。"""
     lines = [
         f"⏰ {when.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"📊 幣別: {signal['symbol']}",
+        f"📊 幣別: #{signal['symbol']}",
     ]
     if "risk" in signal:
         lines.append(f"💡 風險: {signal['risk']}")
@@ -167,7 +167,7 @@ def format_target_hit(hit: dict, when: datetime) -> str:
     """格式化目標達成通知：每個達成的目標自己一行，✅ 開頭。"""
     lines = [
         f"⏰ {when.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"📊 幣別: {hit['symbol']}",
+        f"📊 幣別: #{hit['symbol']}",
         "",
     ]
     for h in hit["hits"]:
