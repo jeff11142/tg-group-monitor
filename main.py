@@ -148,7 +148,11 @@ async def main() -> None:
 
         if forward_to is not None:
             try:
-                header = f"📣 來自「{chat_name}」的 {sender_name}：\n"
+                # 頻道貼文的發送者就是頻道本身，名字會重複，這時只顯示來源
+                if sender_name and sender_name != chat_name:
+                    header = f"📣 來自「{chat_name}」的 {sender_name}：\n"
+                else:
+                    header = f"📣 來自「{chat_name}」：\n"
                 await client.send_message(forward_to, header + text)
             except Exception as e:
                 print(f"[TG 轉發失敗] {e}")
@@ -163,4 +167,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n已停止監聽。")
