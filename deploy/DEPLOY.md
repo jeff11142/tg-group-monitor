@@ -17,13 +17,20 @@ python main.py          # 輸入手機驗證碼（與兩步驗證密碼）完成
 
 ## 步驟 1：把程式與憑證傳到 VPS
 
+程式碼用 git clone，機密檔（`.env`、`.session`）因為被 .gitignore 擋住、不在 repo 裡，要另外 scp 補上。
+
 ```bash
-# 在本機執行，把整個專案打包上傳（含 .env 與 .session）
-cd ~/Documents/個人專案
-scp -r tg-group-monitor  user@你的VPS_IP:/tmp/tg-group-monitor
+# 在 VPS 上：clone 程式碼（不含機密檔）
+git clone https://github.com/jeff11142/tg-group-monitor.git /opt/tg-group-monitor
+
+# 在本機上：把 git 帶不過去的兩個機密檔單獨補傳
+cd ~/Documents/個人專案/tg-group-monitor
+scp .env tg_monitor.session  user@你的VPS_IP:/opt/tg-group-monitor/
 ```
 
-> 注意：`.env` 和 `*.session` 平常被 .gitignore 擋住、不會進 git；但 **VPS 需要它們**，所以這裡用 scp 直接傳，不要走 git。
+> 注意：`.env`（API 憑證）和 `*.session`（登入態）絕不進 git，所以 clone 完一定要記得補 scp，否則程式會因找不到 `.env` 而無法啟動。
+>
+> 之後 VPS 要更新程式碼，直接 `cd /opt/tg-group-monitor && git pull` 即可，機密檔不受影響。
 
 ## 步驟 2：VPS 上安裝環境
 
