@@ -1,0 +1,14 @@
+# 機密：API 憑證與登入 session 絕不可進版控
+.env
+*.session
+*.session-journal
+
+# 記錄檔
+*.jsonl
+messages.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
