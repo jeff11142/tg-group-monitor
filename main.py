@@ -28,7 +28,6 @@ PHONE = _get("PHONE")
 SESSION_NAME = _get("SESSION_NAME", "tg_monitor")
 SOURCE_CHAT = _get("SOURCE_CHAT")
 KEYWORDS = [k.strip().lower() for k in _get("KEYWORDS").split(",") if k.strip()]
-FORWARD_TO = _get("FORWARD_TO")
 BOT_TOKEN = _get("BOT_TOKEN")
 BOT_TARGET = _get("BOT_TARGET")
 WEBHOOK_URL = _get("WEBHOOK_URL")
@@ -123,13 +122,12 @@ async def main() -> None:
     if source is None:
         raise SystemExit("未設定 SOURCE_CHAT（要監聽的群組）。先把 LIST_DIALOGS=1 跑一次找 id。")
 
-    forward_to = _parse_chat(FORWARD_TO)
     http = httpx.AsyncClient(timeout=10)
 
     bot_status = f"開 → {BOT_TARGET}" if (BOT_TOKEN and BOT_TARGET) else "關"
     print(f"開始監聽：{SOURCE_CHAT}")
     print(f"關鍵字：{KEYWORDS or '（無，全部訊息）'}")
-    print(f"Bot 轉發：{bot_status}  | 個人帳號轉發：{FORWARD_TO or '關'}  | Webhook：{'開' if WEBHOOK_URL else '關'}")
+    print(f"Bot 轉發：{bot_status}  | Webhook：{'開' if WEBHOOK_URL else '關'}")
 
     @client.on(events.NewMessage(chats=source))
     async def handler(event: events.NewMessage.Event) -> None:
@@ -163,16 +161,9 @@ async def main() -> None:
         if LOG_TO_FILE:
             write_log(payload)
 
-        # 用 Bot 轉發（推薦）：你的帳號不做發送動作
+        # 用 Bot 轉發：你的帳號只監聽、不做任何發送動作
         if BOT_TOKEN and BOT_TARGET:
             await send_via_bot(http, text)
-
-        # 用個人帳號轉發（FORWARD_TO 有設才會發；與 Bot 轉發可二擇一或併用）
-        if forward_to is not None:
-            try:
-                await client.send_message(forward_to, text)
-            except Exception as e:
-                print(f"[TG 轉發失敗] {e}")
 
         if WEBHOOK_URL:
             await send_webhook(http, payload)
