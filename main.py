@@ -90,7 +90,11 @@ async def main() -> None:
         raise SystemExit(f"缺少設定：{', '.join(missing)}，請複製 config.example.env 為 .env 並填寫")
 
     client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
-    await client.start(phone=PHONE or None)
+    # 有填 PHONE 就用；沒填則讓 Telethon 互動詢問（傳 None 會關掉互動而報錯）
+    if PHONE:
+        await client.start(phone=PHONE)
+    else:
+        await client.start()
     me = await client.get_me()
     print(f"已登入：{me.first_name} (@{me.username})")
 
