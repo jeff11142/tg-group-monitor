@@ -7,6 +7,9 @@
 *.jsonl
 messages.jsonl
 
+# 接收者 DB（包含他人 chat_id，等同個資；應該保留在 VPS 上而不入版控）
+*.db
+
 # Python
 __pycache__/
 *.pyc

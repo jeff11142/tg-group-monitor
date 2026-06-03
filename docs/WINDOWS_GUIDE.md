@@ -39,9 +39,10 @@
 8. [本機首次登入(產生登入檔)](#part-8-本機首次登入產生登入檔)
 9. [本機快速測試](#part-9-本機快速測試)
 10. [VPS 部署](#part-10-vps-部署)
-11. [日常維運](#part-11-日常維運)
-12. [常見問題排除](#part-12-常見問題排除)
-13. [安全提醒](#part-13-安全提醒)
+11. [管理接收者（用 Bot 指令）](#part-11-管理接收者用-bot-指令)
+12. [日常維運](#part-12-日常維運)
+13. [常見問題排除](#part-13-常見問題排除)
+14. [安全提醒](#part-14-安全提醒)
 
 ---
 
@@ -287,12 +288,16 @@ KEYWORDS=
 
 BOT_TOKEN=123456789:AAEhBP0nvb4PhqWxxxxxxxxxxxxxxxxxxxx
 BOT_TARGET=987654321
+ADMIN_CHAT_ID=987654321
 
 WEBHOOK_URL=
 LOG_TO_FILE=1
 LOG_FILE=messages.jsonl
 LIST_DIALOGS=1
 ```
+
+> 💡 `ADMIN_CHAT_ID` 通常**和 `BOT_TARGET` 一樣**（你自己的 chat_id），
+> 這代表「能對 Bot 下管理指令的人是你」，其他人對 Bot 講話只會被回覆 chat_id 提示。
 
 **特別注意 `LIST_DIALOGS=1`**:這個設定讓程式跑起來「只列出你的對話清單,然後結束」,
 方便我們找出要監聽的群組 ID。
@@ -617,7 +622,42 @@ systemctl status tg-group-monitor
 
 ---
 
-## Part 11 日常維運
+## Part 11 管理接收者（用 Bot 指令）
+
+服務啟動後，**直接在 TG 跟你的 Bot 對話**就能管理「誰會收到通知」。完全不用 SSH、不用碰程式碼。
+
+### 可用指令（只有你能用，因為你是 admin）
+
+| 指令 | 範例 | 行為 |
+|------|------|------|
+| `/list` | `/list` | 列出所有接收者，含啟用狀態 |
+| `/add` | `/add 123456789 Alice` | 新增接收者；name 可省略 |
+| `/remove` | `/remove 123456789` | 從清單移除 |
+| `/enable` | `/enable 123456789` | 啟用某接收者 |
+| `/disable` | `/disable 123456789` | 暫停某接收者（不刪資料、可恢復） |
+| `/myid` | `/myid` | 回你自己的 chat_id |
+| `/help` | `/help` | 顯示指令清單 |
+
+### 怎麼幫朋友開通接收？
+
+1. **告訴朋友先對 Bot 按 START**（搜尋你的 Bot username，例如 `@jeff_tg_monitor_bot`）
+2. 朋友對 Bot 隨便講一句話（例如「你好」）
+3. Bot 會自動回他「你的 chat_id 是 12345678」
+4. 朋友把這個數字傳給你
+5. 你在自己跟 Bot 的對話打 `/add 12345678 朋友的名字`
+6. 從此朋友會跟著收到所有訊號通知
+
+### 接收者資料存在哪？
+
+VPS 上的 `/opt/tg-group-monitor/recipients.db`（SQLite 檔）。
+這個檔**不會進 GitHub**，每台機器自己一份。
+
+> ⚠️ 第一次跑時，程式會自動把 `BOT_TARGET`（也就是你自己的 chat_id）加進清單當第一筆，
+> 所以剛部署完畢，你已經會收到通知，不用先 `/add` 自己。
+
+---
+
+## Part 12 日常維運
 
 以下指令都在 **VPS 上以 root 身分執行**(SSH 進去後直接打)。
 
@@ -681,7 +721,7 @@ tail -n 20 /opt/tg-group-monitor/messages.jsonl
 
 ---
 
-## Part 12 常見問題排除
+## Part 13 常見問題排除
 
 ### Q1. PowerShell 跳「`.venv` could not be loaded」或「ApplicationFailedException」
 
@@ -769,7 +809,7 @@ systemctl restart tg-group-monitor
 
 ---
 
-## Part 13 安全提醒
+## Part 14 安全提醒
 
 1. **`.env` 和 `tg_monitor.session` 絕對不要外流**
    - `.env` 含 API 憑證和 Bot Token
@@ -804,4 +844,4 @@ systemctl restart tg-group-monitor
 - 想更新程式碼(`git pull`)
 - 或想關掉(`systemctl stop tg-group-monitor`)
 
-有任何問題回到 **Part 12 常見問題** 找答案,或把錯誤訊息貼給工程師朋友看。
+有任何問題回到 **Part 13 常見問題** 找答案,或把錯誤訊息貼給工程師朋友看。

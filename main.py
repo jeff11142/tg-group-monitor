@@ -16,6 +16,8 @@ import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
+import recipients
+
 load_dotenv()
 
 
@@ -31,6 +33,7 @@ SOURCE_CHAT = _get("SOURCE_CHAT")
 KEYWORDS = [k.strip().lower() for k in _get("KEYWORDS").split(",") if k.strip()]
 BOT_TOKEN = _get("BOT_TOKEN")
 BOT_TARGET = _get("BOT_TARGET")
+ADMIN_CHAT_ID = _get("ADMIN_CHAT_ID")
 WEBHOOK_URL = _get("WEBHOOK_URL")
 LOG_TO_FILE = _get("LOG_TO_FILE", "1") == "1"
 LOG_FILE = _get("LOG_FILE", "messages.jsonl")
@@ -179,18 +182,105 @@ async def list_dialogs(client: TelegramClient) -> None:
         print(f"[{kind}] {dialog.name!r}  id={dialog.id}")
 
 
-async def send_via_bot(http: httpx.AsyncClient, text: str) -> None:
-    """用 TG Bot 把訊息發到 BOT_TARGET（你的個人帳號不參與發送，降低風控風險）。"""
-    try:
-        resp = await http.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": BOT_TARGET, "text": text, "disable_web_page_preview": True},
-        )
-        data = resp.json()
-        if not data.get("ok"):
-            print(f"[bot 轉發失敗] {data.get('description')}")
-    except Exception as e:  # 不讓單次失敗中斷監聽
-        print(f"[bot 轉發失敗] {e}")
+async def broadcast_via_bot(http: httpx.AsyncClient, text: str) -> None:
+    """用 TG Bot 廣播給 recipients 表中所有 enabled 的接收者。"""
+    ids = recipients.list_enabled_ids()
+    if not ids:
+        print("[broadcast] 沒有任何 enabled 接收者，訊息略過")
+        return
+    for chat_id in ids:
+        try:
+            resp = await http.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                print(f"[bot 轉發失敗 {chat_id}] {data.get('description')}")
+        except Exception as e:  # 不讓單次失敗中斷監聽
+            print(f"[bot 轉發失敗 {chat_id}] {e}")
+
+
+ADMIN_HELP_TEXT = (
+    "管理員指令：\n"
+    "/list — 列出所有接收者\n"
+    "/add <chat_id> [name] — 新增接收者\n"
+    "/remove <chat_id> — 移除接收者\n"
+    "/enable <chat_id> — 啟用接收者\n"
+    "/disable <chat_id> — 暫停接收者\n"
+    "/myid — 顯示自己的 chat_id\n"
+    "/help — 顯示此說明"
+)
+NON_ADMIN_HINT = (
+    "你好！\n"
+    "你的 chat_id 是 {chat_id}\n"
+    "要接收訊號通知，請把這個 chat_id 給管理員開通。"
+)
+
+
+def _format_recipient_line(r: dict) -> str:
+    flag = "✅" if r["enabled"] else "⏸️"
+    name = f" ({r['name']})" if r.get("name") else ""
+    return f"{flag} {r['chat_id']}{name}"
+
+
+async def _handle_admin_command(event, text: str) -> None:
+    parts = text.split(None, 2)  # 切最多 3 段：cmd, arg1, rest
+    cmd = parts[0].lower()
+
+    if cmd == "/list":
+        items = recipients.list_all()
+        if not items:
+            await event.reply("(尚無接收者)")
+            return
+        lines = [f"接收者清單（共 {len(items)} 筆）："]
+        lines.extend(_format_recipient_line(r) for r in items)
+        await event.reply("\n".join(lines))
+        return
+
+    if cmd == "/myid":
+        await event.reply(f"你的 chat_id 是 {event.sender_id}")
+        return
+
+    if cmd == "/help":
+        await event.reply(ADMIN_HELP_TEXT)
+        return
+
+    if cmd in ("/add", "/remove", "/enable", "/disable"):
+        if len(parts) < 2:
+            await event.reply(f"用法：{cmd} <chat_id>" + (" [name]" if cmd == "/add" else ""))
+            return
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await event.reply(f"chat_id 必須是數字，收到：{parts[1]!r}")
+            return
+
+        if cmd == "/add":
+            name = parts[2].strip() if len(parts) >= 3 else None
+            if recipients.add(target_id, name):
+                tag = f" ({name})" if name else ""
+                await event.reply(f"已新增 {target_id}{tag}")
+            else:
+                await event.reply(f"{target_id} 已存在，不重複新增")
+        elif cmd == "/remove":
+            if recipients.remove(target_id):
+                await event.reply(f"已移除 {target_id}")
+            else:
+                await event.reply(f"找不到 {target_id}")
+        elif cmd == "/enable":
+            if recipients.set_enabled(target_id, True):
+                await event.reply(f"已啟用 {target_id}")
+            else:
+                await event.reply(f"找不到 {target_id}")
+        elif cmd == "/disable":
+            if recipients.set_enabled(target_id, False):
+                await event.reply(f"已暫停 {target_id}")
+            else:
+                await event.reply(f"找不到 {target_id}")
+        return
+
+    await event.reply("未知指令，輸入 /help 看可用指令")
 
 
 async def send_webhook(http: httpx.AsyncClient, payload: dict) -> None:
@@ -220,18 +310,27 @@ async def main() -> None:
     if missing:
         raise SystemExit(f"缺少設定：{', '.join(missing)}，請複製 config.example.env 為 .env 並填寫")
 
-    client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
+    # 初始化接收者 DB；若 DB 空且設了 BOT_TARGET，自動把 BOT_TARGET 灌進去當第一筆
+    recipients.init()
+    if recipients.count() == 0 and BOT_TARGET:
+        try:
+            recipients.add(int(BOT_TARGET), name="bootstrap")
+            print(f"[bootstrap] 自動把 BOT_TARGET={BOT_TARGET} 加入接收者清單")
+        except ValueError:
+            print(f"[bootstrap] BOT_TARGET={BOT_TARGET!r} 不是合法數字，跳過自動加入")
+
+    user_client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
     # 有填 PHONE 就用；沒填則讓 Telethon 互動詢問（傳 None 會關掉互動而報錯）
     if PHONE:
-        await client.start(phone=PHONE)
+        await user_client.start(phone=PHONE)
     else:
-        await client.start()
-    me = await client.get_me()
+        await user_client.start()
+    me = await user_client.get_me()
     print(f"已登入：{me.first_name} (@{me.username})")
 
     if LIST_DIALOGS:
-        await list_dialogs(client)
-        await client.disconnect()
+        await list_dialogs(user_client)
+        await user_client.disconnect()
         return
 
     source = _parse_chat(SOURCE_CHAT)
@@ -240,12 +339,38 @@ async def main() -> None:
 
     http = httpx.AsyncClient(timeout=10)
 
-    bot_status = f"開 → {BOT_TARGET}" if (BOT_TOKEN and BOT_TARGET) else "關"
+    # 啟動 bot 客戶端（收 admin 指令、回覆非 admin）
+    bot_client: TelegramClient | None = None
+    admin_id: int | None = None
+    if BOT_TOKEN and ADMIN_CHAT_ID:
+        try:
+            admin_id = int(ADMIN_CHAT_ID)
+        except ValueError:
+            print(f"[警告] ADMIN_CHAT_ID 不是合法數字：{ADMIN_CHAT_ID!r}，Bot 指令模式停用")
+            admin_id = None
+
+    if BOT_TOKEN and admin_id is not None:
+        bot_client = TelegramClient("tg_monitor_bot", int(API_ID), API_HASH)
+        await bot_client.start(bot_token=BOT_TOKEN)
+
+        @bot_client.on(events.NewMessage(incoming=True))
+        async def _bot_router(event):
+            if not event.is_private:
+                return  # 忽略群組/頻道訊息
+            if event.sender_id != admin_id:
+                await event.reply(NON_ADMIN_HINT.format(chat_id=event.sender_id))
+                return
+            text = (event.message.message or "").strip()
+            if text:
+                await _handle_admin_command(event, text)
+
+    bot_cmd_status = f"開（admin={admin_id}）" if bot_client else "關"
     print(f"開始監聽：{SOURCE_CHAT}")
     print(f"關鍵字：{KEYWORDS or '（無，全部訊息）'}")
-    print(f"Bot 轉發：{bot_status}  | Webhook：{'開' if WEBHOOK_URL else '關'}")
+    print(f"Bot 轉發：{'開' if BOT_TOKEN else '關'} | Bot 指令：{bot_cmd_status} | Webhook：{'開' if WEBHOOK_URL else '關'}")
+    print(f"接收者：{recipients.count()} 筆")
 
-    @client.on(events.NewMessage(chats=source))
+    @user_client.on(events.NewMessage(chats=source))
     async def handler(event: events.NewMessage.Event) -> None:
         text = event.message.message or ""
         if not _matches(text):
@@ -290,17 +415,22 @@ async def main() -> None:
         if LOG_TO_FILE:
             write_log(payload)
 
-        # 用 Bot 轉發：訊號訊息用自訂格式，其他訊息原樣轉發
-        if BOT_TOKEN and BOT_TARGET:
-            await send_via_bot(http, formatted or text)
+        # 用 Bot 廣播給 recipients 表中所有 enabled 接收者；訊號訊息用自訂格式，其他訊息原樣轉發
+        if BOT_TOKEN:
+            await broadcast_via_bot(http, formatted or text)
 
         if WEBHOOK_URL:
             await send_webhook(http, payload)
 
     try:
-        await client.run_until_disconnected()
+        coros = [user_client.run_until_disconnected()]
+        if bot_client:
+            coros.append(bot_client.run_until_disconnected())
+        await asyncio.gather(*coros)
     finally:
         await http.aclose()
+        if bot_client:
+            await bot_client.disconnect()
 
 
 if __name__ == "__main__":

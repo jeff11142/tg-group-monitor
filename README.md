@@ -61,9 +61,24 @@ python main.py
 |------|------|
 | `SOURCE_CHAT` | 要監聽的群組：@username、數字 ID（如 `-1001234567890`） |
 | `KEYWORDS` | 逗號分隔，包含任一即命中；**留空＝全部訊息** |
-| `FORWARD_TO` | 轉發目標 TG：@username、數字 ID、或 `me`（自己的 Saved Messages） |
+| `BOT_TOKEN` | TG Bot token（@BotFather 申請）；命中訊息會用此 bot 廣播給接收者清單 |
+| `BOT_TARGET` | 第一次跑時自動加入接收者清單的「初始接收者」chat_id；之後動態管理請對 bot 用指令 |
+| `ADMIN_CHAT_ID` | 能對 bot 下管理指令的 chat_id（通常 = `BOT_TARGET`），其他人對 bot 講話只會被回覆 chat_id |
 | `WEBHOOK_URL` | 接收 JSON 的 URL；自動偵測 Discord webhook 並改用其格式 |
 | `LOG_TO_FILE` | `1`＝同時寫入 `LOG_FILE`（JSON Lines） |
+
+接收者清單存在 `recipients.db`（SQLite），透過 bot 指令動態管理：
+
+| 指令（只有 admin 能用） | 行為 |
+|------|------|
+| `/list` | 列出所有接收者與啟用狀態 |
+| `/add <chat_id> [name]` | 新增接收者 |
+| `/remove <chat_id>` | 移除接收者 |
+| `/enable <chat_id>` / `/disable <chat_id>` | 暫停/恢復某接收者，不刪資料 |
+| `/myid` | 回你自己的 chat_id |
+| `/help` | 顯示指令列表 |
+
+非 admin 對 bot 講話只會收到「你的 chat_id 是 X」的提示，方便他們把 ID 給你開通。
 
 ## 長期掛在背景
 
