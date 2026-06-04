@@ -154,12 +154,14 @@ async def _on_signal(signal: dict) -> None:
             print(f"[trader] {symbol} 下單量太小（qty={qty}），請調高 TRADE_USDT，略過")
             return
 
-        # 預檢：分批後最小一份是否仍滿足最小金額（否則 OCO 會被幣安拒絕）
-        smallest = Decimal(str(min(TP_RATIOS))) / Decimal(str(sum(TP_RATIOS)))
-        if qty * price * smallest < filt["min_notional"]:
-            print(f"[trader] {symbol} 分批後最小一份 < 最小金額 {filt['min_notional']}，"
-                  f"請調高 TRADE_USDT，略過")
-            return
+        # 預檢：現貨每張 OCO 都是真實賣單，分批後最小一份也要滿足最小金額。
+        # 合約的止盈是 reduce-only、止損是 closePosition（平倉單），幣安不做此檢查，故略過。
+        if not FUTURES:
+            smallest = Decimal(str(min(TP_RATIOS))) / Decimal(str(sum(TP_RATIOS)))
+            if qty * price * smallest < filt["min_notional"]:
+                print(f"[trader] {symbol} 分批後最小一份 < 最小金額 {filt['min_notional']}，"
+                      f"請調高 TRADE_USDT，略過")
+                return
 
         order = await _open_entry(symbol, qty, price, filt)
         buy_id = order["orderId"]
