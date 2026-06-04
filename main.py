@@ -633,15 +633,17 @@ async def main() -> None:
         if LOG_TO_FILE:
             write_log(payload)
 
+        # Bot 廣播、Webhook、自動下單三者「同時」並行觸發，互不等待
+        jobs = []
         if BOT_TOKEN:
-            await broadcast_via_bot(http, formatted)
-
+            jobs.append(broadcast_via_bot(http, formatted))
         if WEBHOOK_URL:
-            await send_webhook(http, payload)
-
+            jobs.append(send_webhook(http, payload))
         # 只有「解析成功的進場訊號」才自動下單；目標達成通知不下單
         if trader is not None and signal is not None:
-            await trader.on_signal(signal)
+            jobs.append(trader.on_signal(signal))
+        if jobs:
+            await asyncio.gather(*jobs)
 
     try:
         coros = [user_client.run_until_disconnected()]
