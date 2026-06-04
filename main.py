@@ -255,6 +255,41 @@ async def send_bot_dm(http: httpx.AsyncClient, chat_id: int, text: str) -> bool:
         return False
 
 
+PUBLIC_COMMANDS = [
+    {"command": "myid", "description": "顯示你的 chat_id"},
+    {"command": "help", "description": "訂閱與使用說明"},
+]
+ADMIN_COMMANDS = [
+    {"command": "sub", "description": "開通/續期訂閱 <id> <天數>"},
+    {"command": "unsub", "description": "停用訂閱 <id>"},
+    {"command": "subs", "description": "列出訂閱者與到期狀態"},
+    {"command": "add", "description": "新增無期限接收者 <id>"},
+    {"command": "remove", "description": "移除接收者 <id>"},
+    {"command": "enable", "description": "啟用接收者 <id>"},
+    {"command": "disable", "description": "暫停接收者 <id>"},
+    {"command": "list", "description": "列出所有接收者"},
+    {"command": "myid", "description": "顯示你的 chat_id"},
+    {"command": "help", "description": "顯示管理指令說明"},
+]
+
+
+async def setup_bot_commands(http: httpx.AsyncClient, admin_id: int | None) -> None:
+    """設定 bot 的 / 指令選單：一般人只看到 PUBLIC，管理員額外看到 ADMIN 指令。"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands"
+    try:
+        # 預設（所有人）
+        await http.post(url, json={"commands": PUBLIC_COMMANDS})
+        # 管理員專屬（限定 admin 的私訊）
+        if admin_id is not None:
+            await http.post(url, json={
+                "commands": ADMIN_COMMANDS,
+                "scope": {"type": "chat", "chat_id": admin_id},
+            })
+        print("[bot] 指令選單已設定（一般／管理員分流）")
+    except Exception as e:
+        print(f"[bot] 設定指令選單失敗：{e}")
+
+
 async def broadcast_via_bot(http: httpx.AsyncClient, text: str) -> None:
     """用 TG Bot 廣播給「已啟用且未到期」的訂閱者。"""
     ids = recipients.list_active_ids()
@@ -520,8 +555,9 @@ async def main() -> None:
             if text:
                 await _handle_admin_command(event, text)
 
-    # 訂閱到期背景檢查：過期自動停推並通知本人
+    # 設定 bot 指令選單（一般／管理員分流）＋ 訂閱到期背景檢查
     if BOT_TOKEN:
+        await setup_bot_commands(http, admin_id)
         asyncio.create_task(_subscription_loop())
 
     # 啟用幣安現貨自動交易（延遲 import，沒開就不需要裝 python-binance）
