@@ -30,6 +30,8 @@ TESTNET = _get("BINANCE_TESTNET", "1") == "1"
 API_KEY = _get("BINANCE_API_KEY")
 API_SECRET = _get("BINANCE_API_SECRET")
 TRADE_USDT = float(_get("TRADE_USDT", "50"))
+# 自動最小金額：1=每筆依交易對自動算出「能成功下單＋拆得出分批」的最小金額並用它下單
+AUTO_MIN_AMOUNT = _get("AUTO_MIN_AMOUNT", "0") == "1"
 MAX_OPEN_TRADES = int(_get("MAX_OPEN_TRADES", "5"))
 TP_RATIOS = [float(x) for x in _get("TP_RATIOS", "30,30,20,20").split(",") if x.strip()]
 SL_LIMIT_BUFFER_PCT = float(_get("SL_LIMIT_BUFFER_PCT", "0.3"))
@@ -94,6 +96,28 @@ def _oid(resp: dict):
     return resp.get("orderId") or resp.get("algoId")
 
 
+def _min_amount(filt: dict, price: float, n: int) -> float:
+    """算出某交易對「能成功下單且拆得出 n 段分批」的最小金額（USDT，含緩衝）。
+
+    需同時滿足：
+    - 進場名目 ≥ minNotional
+    - 分批後最小一份 ≥ minQty（每段才下得了單）
+    - 現貨額外要求：最小一份名目也 ≥ minNotional（OCO 每腿都是真實賣單）
+    """
+    ratios = TP_RATIOS[:n]
+    smallest = min(ratios) / sum(ratios)
+    min_notional = float(filt["min_notional"])
+    min_qty = float(filt["min_qty"])
+    step = float(filt["step"])
+    # 每段至少 minQty：總量 ≥ (minQty + 一個 step 緩衝) / 最小比例
+    notional_for_qty = (min_qty + step) / smallest * price
+    if FUTURES:
+        base = max(min_notional, notional_for_qty)
+    else:
+        base = max(min_notional / smallest, notional_for_qty)
+    return base * 1.05  # 5% 緩衝，避免取整後低於門檻
+
+
 async def _get_filters(symbol: str) -> dict | None:
     if symbol in _filters_cache:
         return _filters_cache[symbol]
@@ -154,7 +178,14 @@ async def _on_signal(signal: dict) -> None:
             return
 
         price = _quantize(entry, filt["tick"])
-        qty = _quantize(TRADE_USDT / float(price), filt["step"])
+        n = min(len(TP_RATIOS), len(targets))
+        if AUTO_MIN_AMOUNT:
+            amount = _min_amount(filt, float(price), n)
+            print(f"[trader] {symbol} 自動最小金額：{amount:.2f} USDT"
+                  f"（minNotional={filt['min_notional']}, minQty={filt['min_qty']}）")
+        else:
+            amount = TRADE_USDT
+        qty = _quantize(amount / float(price), filt["step"])
         if qty < filt["min_qty"] or qty * price < filt["min_notional"]:
             print(f"[trader] {symbol} 下單量太小（qty={qty}），請調高 TRADE_USDT，略過")
             return
