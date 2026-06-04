@@ -146,14 +146,23 @@ async def live_run(signal: dict, args: argparse.Namespace) -> None:
     client = bt._client
 
     ticker = await asyncio.to_thread(client.futures_symbol_ticker, symbol=symbol)
-    market = float(ticker["price"])
-    if not args.use_signal_entry:
+    market = float(ticker.get("price") or 0)
+    use_signal_entry = args.use_signal_entry
+    if market <= 0:
+        print(f"\n⚠️ {symbol} 在 testnet 沒有現價報價（流動性低／新上市），無法以現價進場。")
+        print("   testnet 很可能無法撮合成交。想看完整鏈路（成交→止盈止損），"
+              "請改用活躍幣的訊號（如 BTCUSDT / ETHUSDT）。")
+        print("   這次先用訊號原始進場價送出（多半會掛著不成交）。")
+        use_signal_entry = True
+
+    if not use_signal_entry:
         new_entry = market * 1.001  # 貼現價上方一點 → 立即成交
         signal = rescale(signal, new_entry)
         print(f"\n進場改用現價 {new_entry:.6g}（保證成交；目標/停損依原訊號%重算）")
     else:
-        print(f"\n用訊號原始進場價 {signal['entry']}（現價 {market}）"
-              + ("，低於市價會掛著等成交" if signal["entry"] < market else ""))
+        note = f"（現價 {market}）" if market > 0 else "（testnet 無現價）"
+        tail = "，低於市價會掛著等成交" if 0 < market and signal["entry"] < market else ""
+        print(f"\n用訊號原始進場價 {signal['entry']}{note}{tail}")
 
     print(f"目標 {[round(t['price'], 6) for t in signal['targets']]} | "
           f"停損 {round(signal['stops'][0]['price'], 6)}")
