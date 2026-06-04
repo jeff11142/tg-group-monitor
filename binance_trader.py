@@ -252,9 +252,7 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
     except BinanceAPIException as e:
         print(f"[trader] trade#{tid} 掛保護單失敗：{e.status_code} {e.message}")
     except Exception as e:
-        import traceback
         print(f"[trader] trade#{tid} 監控失敗：{e!r}")
-        traceback.print_exc()
 
 
 async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dict) -> bool:
