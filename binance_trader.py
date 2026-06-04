@@ -62,6 +62,14 @@ _client: Client | None = None
 _filters_cache: dict = {}
 # 進場鎖：序列化「檢查額度→下單→建檔」，避免多訊號同時湧入時超開過 MAX_OPEN_TRADES
 _entry_lock = asyncio.Lock()
+# 保留背景任務參考，避免事件迴圈只持弱參考導致任務被 GC（Python asyncio 官方警告）
+_bg_tasks: set = set()
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 def init() -> None:
@@ -205,7 +213,7 @@ async def _on_signal(signal: dict) -> None:
                          buy_order_id=buy_id, signal=signal)
         print(f"[trader] {symbol} 限價{('合約' if FUTURES else '')}進場單已掛 @ {price}"
               f"（qty={qty}，trade#{tid}），等待成交…")
-        asyncio.create_task(_watch_and_protect(tid, order.get("status", "")))
+        _spawn(_watch_and_protect(tid, order.get("status", "")))
 
 
 async def _open_entry(symbol: str, qty: Decimal, price: Decimal, filt: dict) -> dict:
@@ -435,12 +443,12 @@ async def resume() -> None:
     """程式重啟時，把仍在等成交的買單重新接上監控。"""
     for t in trades.list_status("PENDING_BUY"):
         print(f"[trader] 回復未完成交易 trade#{t['id']} {t['symbol']}，繼續等待成交…")
-        asyncio.create_task(_watch_and_protect(t["id"]))
+        _spawn(_watch_and_protect(t["id"]))
 
 
 def start_monitor() -> None:
     """啟動背景對帳迴圈：自動收單（#1）+ TP1 後移動停損到保本（#2）。"""
-    asyncio.create_task(_monitor_loop())
+    _spawn(_monitor_loop())
     print(f"[trader] 對帳迴圈啟動（每 {MONITOR_INTERVAL:g} 秒）"
           f"{'，TP1 後移動停損到保本' if BREAKEVEN_AFTER_TP1 else ''}")
 
