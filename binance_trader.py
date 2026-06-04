@@ -1,11 +1,14 @@
-"""幣安現貨自動化交易：依訊號限價進場，成交後掛 4 張 OCO（多止盈 + SL1 全清）。
+"""幣安自動化交易：依訊號限價進場，成交後掛多段止盈 + SL1 全清止損。
 
-策略（靜態）：進場時就把止盈/止損一次掛好，之後交易所自己執行、程式不必盯盤。
-- 只做多（現貨無法放空）。
-- 把倉位依 TP_RATIOS 拆成數份，每份一張 OCO：止盈腿在各自的目標價、止損腿都在 SL1。
-- 價格碰 SL1 時，所有未完成 OCO 的止損腿同時觸發 = 全部清倉。
+用 BINANCE_FUTURES 切換現貨／合約：
+- 現貨（只做多）：倉位拆成數份，每份一張 OCO（止盈腿在各目標價、止損腿都在 SL1）。
+- 合約（USDT-M，目前做多，預留做空）：N 張 reduce-only 止盈 + 1 張 STOP_MARKET
+  closePosition 止損，碰 SL1 直接把整個倉位平掉。槓桿/保證金模式由 LEVERAGE/MARGIN_TYPE 設定。
 
-⚠️ 預設連幣安 testnet（測試網假錢）。確認無誤再把 BINANCE_TESTNET 設 0 上正式網。
+策略（靜態）：進場時就把止盈/止損一次掛好；之後交易所自己執行，程式只負責對帳收單與保本。
+
+⚠️ 預設連 testnet（假錢）。合約 testnet 與現貨 testnet 是不同網站、不同金鑰。
+   現貨：testnet.binance.vision；合約：testnet.binancefuture.com
 """
 
 import asyncio
@@ -40,6 +43,18 @@ BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
 # 限價買單超過幾分鐘未成交就撤單、釋放持倉額度（0=永不超時，一直等成交）
 ENTRY_TIMEOUT_MIN = float(_get("ENTRY_TIMEOUT_MIN", "30"))
 ENTRY_TIMEOUT_SEC = ENTRY_TIMEOUT_MIN * 60
+# 合約模式（USDT-M 永續）：1=合約 0=現貨
+FUTURES = _get("BINANCE_FUTURES", "0") == "1"
+LEVERAGE = int(_get("LEVERAGE", "1"))
+MARGIN_TYPE = _get("MARGIN_TYPE", "ISOLATED").upper()
+TRADE_SIDE = _get("TRADE_SIDE", "LONG").upper()  # 預留做空；目前只用 LONG
+
+
+def _sides() -> tuple[str, str]:
+    """回傳 (進場方向, 平倉方向)。LONG=BUY/SELL；SHORT=SELL/BUY（合約才支援）。"""
+    if TRADE_SIDE == "SHORT":
+        return "SELL", "BUY"
+    return "BUY", "SELL"
 
 _client: Client | None = None
 _filters_cache: dict = {}
@@ -53,8 +68,9 @@ def init() -> None:
         raise SystemExit("交易已啟用但缺少 BINANCE_API_KEY / BINANCE_API_SECRET")
     _client = Client(API_KEY, API_SECRET, testnet=TESTNET)
     trades.init()
-    mode = "TESTNET 測試網" if TESTNET else "⚠️ 正式網（真錢）"
-    print(f"[trader] 幣安現貨自動交易啟用：{mode} | 每筆 {TRADE_USDT} USDT | "
+    net = "TESTNET 測試網" if TESTNET else "⚠️ 正式網（真錢）"
+    market = f"合約 {LEVERAGE}x {MARGIN_TYPE} {TRADE_SIDE}" if FUTURES else "現貨 LONG"
+    print(f"[trader] 幣安自動交易啟用：{market} | {net} | 每筆 {TRADE_USDT} USDT | "
           f"最多同時 {MAX_OPEN_TRADES} 筆 | 分批 {TP_RATIOS}")
 
 
@@ -76,18 +92,24 @@ def _qstr(value: float, step: str) -> str:
 async def _get_filters(symbol: str) -> dict | None:
     if symbol in _filters_cache:
         return _filters_cache[symbol]
-    info = await _api(_client.get_symbol_info, symbol=symbol)
-    if not info:
+    if FUTURES:
+        info = await _api(_client.futures_exchange_info)
+        sym = next((s for s in info["symbols"] if s["symbol"] == symbol), None)
+    else:
+        sym = await _api(_client.get_symbol_info, symbol=symbol)
+    if not sym:
         return None
-    f = {x["filterType"]: x for x in info["filters"]}
+    f = {x["filterType"]: x for x in sym["filters"]}
     notional = f.get("NOTIONAL") or f.get("MIN_NOTIONAL") or {}
+    # 現貨用 minNotional、合約用 notional
+    min_notional = notional.get("minNotional") or notional.get("notional") or "0"
     parsed = {
         "step": f["LOT_SIZE"]["stepSize"],
         "tick": f["PRICE_FILTER"]["tickSize"],
         "min_qty": Decimal(f["LOT_SIZE"]["minQty"]),
-        "min_notional": Decimal(notional.get("minNotional", "0")),
-        "base": info["baseAsset"],
-        "quote": info["quoteAsset"],
+        "min_notional": Decimal(min_notional),
+        "base": sym["baseAsset"],
+        "quote": sym["quoteAsset"],
     }
     _filters_cache[symbol] = parsed
     return parsed
@@ -139,14 +161,46 @@ async def _on_signal(signal: dict) -> None:
                   f"請調高 TRADE_USDT，略過")
             return
 
-        order = await _api(_client.order_limit_buy, symbol=symbol,
-                           quantity=_qstr(float(qty), filt["step"]),
-                           price=_qstr(float(price), filt["tick"]))
+        order = await _open_entry(symbol, qty, price, filt)
         buy_id = order["orderId"]
         tid = trades.add(symbol=symbol, entry=float(price), qty=float(qty),
                          buy_order_id=buy_id, signal=signal)
-        print(f"[trader] {symbol} 限價買單已掛 @ {price}（qty={qty}，trade#{tid}），等待成交…")
+        print(f"[trader] {symbol} 限價{('合約' if FUTURES else '')}進場單已掛 @ {price}"
+              f"（qty={qty}，trade#{tid}），等待成交…")
         asyncio.create_task(_watch_and_protect(tid, order.get("status", "")))
+
+
+async def _open_entry(symbol: str, qty: Decimal, price: Decimal, filt: dict) -> dict:
+    """下進場限價單；合約會先設好槓桿與保證金模式。"""
+    entry_side, _ = _sides()
+    if FUTURES:
+        await _api(_client.futures_change_leverage, symbol=symbol, leverage=LEVERAGE)
+        try:
+            await _api(_client.futures_change_margin_type, symbol=symbol, marginType=MARGIN_TYPE)
+        except BinanceAPIException as e:
+            if e.code != -4046:  # -4046 = 保證金模式無需變更（已是該模式）
+                raise
+        return await _api(_client.futures_create_order, symbol=symbol, side=entry_side,
+                          type="LIMIT", timeInForce="GTC",
+                          quantity=_qstr(float(qty), filt["step"]),
+                          price=_qstr(float(price), filt["tick"]))
+    # 現貨（只做多）
+    return await _api(_client.order_limit_buy, symbol=symbol,
+                      quantity=_qstr(float(qty), filt["step"]),
+                      price=_qstr(float(price), filt["tick"]))
+
+
+async def _get_order(symbol: str, order_id: int) -> dict:
+    if FUTURES:
+        return await _api(_client.futures_get_order, symbol=symbol, orderId=order_id)
+    return await _api(_client.get_order, symbol=symbol, orderId=order_id)
+
+
+async def _cancel_order(symbol: str, order_id: int) -> None:
+    if FUTURES:
+        await _api(_client.futures_cancel_order, symbol=symbol, orderId=order_id)
+    else:
+        await _api(_client.cancel_order, symbol=symbol, orderId=order_id)
 
 
 async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
@@ -163,7 +217,7 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
             await asyncio.sleep(1.0)
             while True:
                 try:
-                    order = await _api(_client.get_order, symbol=symbol, orderId=order_id)
+                    order = await _get_order(symbol, order_id)
                 except BinanceAPIException as e:
                     if e.code == -2013 and not_found < 10:
                         not_found += 1
@@ -185,11 +239,11 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
                     return
                 await asyncio.sleep(POLL_INTERVAL)
 
-        await _place_oco_grid(trade)
+        await _place_protection(trade)
         trades.set_status(tid, "ACTIVE")
-        print(f"[trader] {symbol} 已成交，OCO 止盈止損掛好，trade#{tid} → ACTIVE")
+        print(f"[trader] {symbol} 已成交，止盈止損掛好，trade#{tid} → ACTIVE")
     except BinanceAPIException as e:
-        print(f"[trader] trade#{tid} 掛 OCO 失敗：{e.status_code} {e.message}")
+        print(f"[trader] trade#{tid} 掛保護單失敗：{e.status_code} {e.message}")
     except Exception as e:
         print(f"[trader] trade#{tid} 監控失敗：{e}")
 
@@ -197,7 +251,7 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
 async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dict) -> bool:
     """限價買單超時：撤單釋放額度。回傳是否「有可觀的部分成交、需改掛 OCO 保護」。"""
     try:
-        await _api(_client.cancel_order, symbol=symbol, orderId=order_id)
+        await _cancel_order(symbol, order_id)
     except BinanceAPIException as e:
         if e.code != -2011:  # -2011 = 訂單已不存在（剛好成交/已撤），忽略
             raise
@@ -209,13 +263,74 @@ async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dic
     if executed >= filt["min_qty"] and executed * price >= filt["min_notional"]:
         # 已部分成交且量足夠拆單 → 用實際成交量保護
         trades.set_qty(tid, float(executed))
-        print(f"[trader] {symbol} 買單超時，已部分成交 {executed}，改用實際量掛 OCO（trade#{tid}）")
+        print(f"[trader] {symbol} 進場單超時，已部分成交 {executed}，改用實際量掛保護單（trade#{tid}）")
         return True
 
     trades.set_status(tid, "CANCELED")
     mins = ENTRY_TIMEOUT_MIN
     print(f"[trader] {symbol} 買單超過 {mins:g} 分鐘未成交，已撤單，trade#{tid} 取消（釋放額度）")
     return False
+
+
+def _split_portions(qty_total: Decimal, n: int, step: str) -> list[Decimal]:
+    """把總量按 TP_RATIOS 拆成 n 份，最後一份吃剩餘避免 dust。"""
+    ratios = TP_RATIOS[:n]
+    total = Decimal(str(sum(ratios)))
+    step_d = Decimal(str(step))
+    portions, allocated = [], Decimal("0")
+    for i in range(n):
+        if i < n - 1:
+            q = _quantize(float(qty_total * Decimal(str(ratios[i])) / total), step)
+        else:
+            q = ((qty_total - allocated) // step_d) * step_d
+        allocated += q
+        portions.append(q)
+    return portions
+
+
+async def _place_protection(trade: dict) -> None:
+    """掛止盈止損：合約走 reduce-only/closePosition，現貨走 OCO 格。"""
+    if FUTURES:
+        await _place_protection_futures(trade)
+    else:
+        await _place_oco_grid(trade)
+
+
+async def _place_protection_futures(trade: dict) -> None:
+    """合約：掛 N 張 reduce-only 止盈 + 1 張 closePosition 止損（碰 SL1 全平）。"""
+    symbol = trade["symbol"]
+    signal = trade["signal"]
+    filt = await _get_filters(symbol)
+    targets = signal["targets"]
+    _, close_side = _sides()
+    sl1 = _quantize(signal["stops"][0]["price"], filt["tick"])
+
+    n = min(len(TP_RATIOS), len(targets))
+    portions = _split_portions(Decimal(str(trade["qty"])), n, filt["step"])
+
+    tp_orders = []
+    for i in range(n):
+        qty_i = portions[i]
+        if qty_i <= 0:
+            continue
+        tp_price = _quantize(targets[i]["price"], filt["tick"])
+        resp = await _api(
+            _client.futures_create_order, symbol=symbol, side=close_side,
+            type="TAKE_PROFIT_MARKET", stopPrice=format(tp_price, "f"),
+            quantity=format(qty_i, "f"), reduceOnly="true",
+        )
+        tp_orders.append({"order_id": resp["orderId"], "qty": float(qty_i),
+                          "tp": float(tp_price), "level": i + 1})
+        print(f"[trader]   TP{i + 1}: {close_side} {qty_i} @ {tp_price}（reduceOnly）")
+
+    # 止損：一張 STOP_MARKET closePosition，碰 SL1 直接把整個倉位平掉
+    sl_resp = await _api(
+        _client.futures_create_order, symbol=symbol, side=close_side,
+        type="STOP_MARKET", stopPrice=format(sl1, "f"), closePosition="true",
+    )
+    print(f"[trader]   SL: {close_side} 全平 @ {sl1}（closePosition）")
+    trades.set_oco(trade["id"], {"mode": "futures", "sl_order_id": sl_resp["orderId"],
+                                 "sl_price": float(sl1), "tp_orders": tp_orders})
 
 
 async def _place_oco_grid(trade: dict) -> None:
@@ -303,6 +418,61 @@ async def _monitor_loop() -> None:
 
 
 async def _reconcile(trade: dict) -> None:
+    if FUTURES:
+        await _reconcile_futures(trade)
+    else:
+        await _reconcile_spot(trade)
+
+
+async def _reconcile_futures(trade: dict) -> None:
+    """合約：倉位歸零就收單；倉位減少（有止盈成交）就把止損移到保本。"""
+    symbol = trade["symbol"]
+    info = trade.get("oco_orders") or {}
+    pos = await _api(_client.futures_position_information, symbol=symbol)
+    amt = abs(float(pos[0]["positionAmt"])) if pos else 0.0
+
+    # #1 自動收單：倉位歸零 = 已全平 → 撤掉殘留止盈止損單、標記 CLOSED
+    if amt == 0:
+        await _api(_client.futures_cancel_all_open_orders, symbol=symbol)
+        trades.set_status(trade["id"], "CLOSED")
+        print(f"[trader] trade#{trade['id']} {symbol} 倉位已平 → CLOSED（釋放持倉額度）")
+        return
+
+    # #2 移動止損到保本：倉位比原始量少 = 有止盈成交（止損會一次全平，不會只少一部分）
+    if (BREAKEVEN_AFTER_TP1 and not trade.get("sl_moved")
+            and amt < float(trade["qty"]) * 0.999):
+        await _move_sl_breakeven_futures(trade, info)
+
+
+async def _move_sl_breakeven_futures(trade: dict, info: dict) -> None:
+    """合約：撤掉舊止損、在進場價重掛 closePosition 止損（保本）。"""
+    symbol = trade["symbol"]
+    filt = await _get_filters(symbol)
+    entry = Decimal(str(trade["entry"]))
+    _, close_side = _sides()
+
+    ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
+    price = Decimal(str(ticker["price"]))
+    if entry >= price:
+        return  # 已回落到進場價附近，設保本會讓止損高於市價，維持原止損
+
+    be = _quantize(float(entry), filt["tick"])
+    old_sl = info.get("sl_order_id")
+    if old_sl:
+        try:
+            await _api(_client.futures_cancel_order, symbol=symbol, orderId=old_sl)
+        except BinanceAPIException as e:
+            if e.code != -2011:
+                raise
+    resp = await _api(_client.futures_create_order, symbol=symbol, side=close_side,
+                      type="STOP_MARKET", stopPrice=format(be, "f"), closePosition="true")
+    info["sl_order_id"] = resp["orderId"]
+    info["sl_price"] = float(be)
+    trades.update_oco(trade["id"], info, sl_moved=True)
+    print(f"[trader] trade#{trade['id']} {symbol} 止盈已觸發，止損移到保本 {be}")
+
+
+async def _reconcile_spot(trade: dict) -> None:
     """檢查一筆 ACTIVE 交易：全平就收單；部分止盈就把剩餘止損移到保本。"""
     symbol = trade["symbol"]
     legs = trade.get("oco_orders") or []

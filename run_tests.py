@@ -14,6 +14,7 @@ OFFLINE_TESTS = [
     ("解析/格式化/標記#", "test_parsing.py", []),
     ("對帳/移保本/收單", "test_reconcile.py", []),
     ("多幣種並發/持倉上限", "test_multi.py", []),
+    ("合約下單/對帳/保本", "test_futures.py", []),
 ]
 LIVE_TESTS = [
     ("testnet 下單鏈路", "test_trade.py", ["--reset"]),
