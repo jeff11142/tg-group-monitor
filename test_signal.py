@@ -145,24 +145,28 @@ async def live_run(signal: dict, args: argparse.Namespace) -> None:
     symbol = signal["symbol"]
     client = bt._client
 
-    ticker = await asyncio.to_thread(client.futures_symbol_ticker, symbol=symbol)
-    market = float(ticker.get("price") or 0)
+    # 用最佳賣價(best ask)當基準，而非最後成交價：testnet 盤口價差常很大，
+    # 用最後成交價算出的買單會掛在賣價下方而不成交。
+    best_ask = 0.0
+    try:
+        ob = await asyncio.to_thread(client.futures_order_book, symbol=symbol, limit=5)
+        if ob.get("asks"):
+            best_ask = float(ob["asks"][0][0])
+    except Exception:
+        pass
     use_signal_entry = args.use_signal_entry
-    if market <= 0:
-        print(f"\n⚠️ {symbol} 在 testnet 沒有現價報價（流動性低／新上市），無法以現價進場。")
-        print("   testnet 很可能無法撮合成交。想看完整鏈路（成交→止盈止損），"
-              "請改用活躍幣的訊號（如 BTCUSDT / ETHUSDT）。")
-        print("   這次先用訊號原始進場價送出（多半會掛著不成交）。")
+    if best_ask <= 0:
+        print(f"\n⚠️ {symbol} 在 testnet 盤口沒有賣單，無法以市價進場。"
+              "改用訊號原始進場價（多半掛著不成交）。建議改用活躍幣測完整流程。")
         use_signal_entry = True
 
     if not use_signal_entry:
-        new_entry = market * 1.001  # 貼現價上方一點 → 立即成交
+        new_entry = best_ask * 1.002  # 略高於最佳賣價 → 立即吃單成交
         signal = rescale(signal, new_entry)
-        print(f"\n進場改用現價 {new_entry:.6g}（保證成交；目標/停損依原訊號%重算）")
+        print(f"\n進場改用最佳賣價 {new_entry:.6g}（吃單立即成交；目標/停損依原訊號%重算）")
     else:
-        note = f"（現價 {market}）" if market > 0 else "（testnet 無現價）"
-        tail = "，低於市價會掛著等成交" if 0 < market and signal["entry"] < market else ""
-        print(f"\n用訊號原始進場價 {signal['entry']}{note}{tail}")
+        note = f"（最佳賣價 {best_ask}）" if best_ask > 0 else "（testnet 無賣單）"
+        print(f"\n用訊號原始進場價 {signal['entry']}{note}")
 
     print(f"目標 {[round(t['price'], 6) for t in signal['targets']]} | "
           f"停損 {round(signal['stops'][0]['price'], 6)}")
