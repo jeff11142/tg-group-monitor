@@ -28,6 +28,31 @@ TARGET_HIT = """VICUSDT
 STOP_HIT = """HOLOUSDT
 🛑 停損價 1: 0.0698 🛑"""
 
+# 中文交易對的目標達成通知：USDT 前面是中文，不該被當成合法交易對
+CN_TARGET_HIT = """币安人生USDT
+🎯 目標價 1: 0.6985 ✅"""
+
+# 中文交易對的完整訊號，且 URL 內含 9FUSDT（hex 編碼），不該誤抓成交易對
+CN_SIGNAL = """🆕 #币安人生USDT
+
+24 小時成交量排名: 50th/574
+市值: 617.08M
+
+風險等級：🟢 一般
+
+➡️ 進場價: 0.6762
+
+🎯 目標價 1: 0.6985
+🎯 目標價 2: 0.7207
+
+🛑 停損價 1: 0.6284
+
+📊 https://www.tradingview.com/chart?symbol=BINANCE%3A%E5%B8%81%E5%AE%89%E4%BA%BA%E7%94%9FUSDT.P"""
+
+# 市場提醒/閒聊訊息：沒有交易對、進場價、目標/停損，全部解析器都該回 None
+MARKET_ALERT = """🔥🔥🔥 ETH price increased 1.43% in the last 15 minutes. Altcoins may follow. Keep an eye out for opportunities.
+ETH 15分鐘內價格上漲1.43%，其他幣種可能會帶動上漲，請留意相關機會+"""
+
 
 def test_tag_symbols():
     print("\n[標記交易對 #]")
@@ -93,6 +118,18 @@ def test_stop_hit():
     check("不含來源的 🛑", "🛑" not in out)
 
 
+def test_reject_invalid():
+    print("\n[非法/非訊號訊息一律不解析]")
+    # 中文交易對的目標達成 → 找不到合法交易對 → None
+    check("中文交易對目標達成不解析", main.parse_target_hit(CN_TARGET_HIT) is None)
+    # 中文交易對完整訊號 → 移除 URL 後找不到合法交易對 → None（不誤抓 URL 內的 9FUSDT）
+    check("中文交易對訊號不解析", main.parse_signal(CN_SIGNAL) is None)
+    # 市場提醒/閒聊 → 三種解析器全部 None
+    check("市場提醒不當成訊號", main.parse_signal(MARKET_ALERT) is None)
+    check("市場提醒不當成目標達成", main.parse_target_hit(MARKET_ALERT) is None)
+    check("市場提醒不當成停損", main.parse_stop_hit(MARKET_ALERT) is None)
+
+
 def test_keyword_match():
     print("\n[關鍵字過濾]")
     check("命中（不分大小寫）", main._matches("這是 ENTRY 訊號") if main.KEYWORDS else True)
@@ -105,6 +142,7 @@ def main_run():
     test_format_signal()
     test_target_hit()
     test_stop_hit()
+    test_reject_invalid()
     test_keyword_match()
     print("\n🎉 解析測試全部通過")
 

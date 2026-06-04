@@ -106,7 +106,7 @@ def tag_symbols(text: str) -> str:
 
 def parse_signal(text: str) -> dict | None:
     """嘗試把訊號訊息解析成結構化資料。沒命中 symbol+entry 就回 None（代表不是訊號）。"""
-    m_symbol = _SYMBOL_RE.search(text)
+    m_symbol = _SYMBOL_RE.search(_SIG_URL.sub("", text))
     m_entry = _SIG_ENTRY.search(text)
     if not (m_symbol and m_entry):
         return None
@@ -188,7 +188,7 @@ def parse_target_hit(text: str) -> dict | None:
     ]
     if not hits:
         return None
-    m_symbol = _SYMBOL_RE.search(text)
+    m_symbol = _SYMBOL_RE.search(_SIG_URL.sub("", text))
     if not m_symbol:
         return None
     return {"symbol": m_symbol.group(1), "hits": hits}
@@ -214,7 +214,7 @@ def parse_stop_hit(text: str) -> dict | None:
     ]
     if not hits:
         return None
-    m_symbol = _SYMBOL_RE.search(text)
+    m_symbol = _SYMBOL_RE.search(_SIG_URL.sub("", text))
     if not m_symbol:
         return None
     return {"symbol": m_symbol.group(1), "hits": hits}
@@ -624,14 +624,17 @@ async def main() -> None:
             "formatted": formatted,
         }
 
+        if formatted is None:
+            print(f"[略過] {payload['time']} {sender_name}: 解析失敗，不推送")
+            return
+
         print(f"[命中] {payload['time']} {sender_name}: {text[:80]}")
 
         if LOG_TO_FILE:
             write_log(payload)
 
-        # 用 Bot 廣播給 recipients 表中所有 enabled 接收者；訊號訊息用自訂格式，其他訊息原樣轉發
         if BOT_TOKEN:
-            await broadcast_via_bot(http, formatted or tag_symbols(text))
+            await broadcast_via_bot(http, formatted)
 
         if WEBHOOK_URL:
             await send_webhook(http, payload)
