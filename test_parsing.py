@@ -25,6 +25,9 @@ TARGET_HIT = """VICUSDT
 目標價 1：0.0497 ✅
 目標價 2：0.0516 ✅"""
 
+STOP_HIT = """HOLOUSDT
+🛑 停損價 1: 0.0698 🛑"""
+
 
 def test_tag_symbols():
     print("\n[標記交易對 #]")
@@ -75,6 +78,21 @@ def test_target_hit():
     check("非訊號文字不誤判", main.parse_target_hit("今天天氣不錯") is None)
 
 
+def test_stop_hit():
+    print("\n[解析觸發停損通知]")
+    s = main.parse_stop_hit(STOP_HIT)
+    check("有解析到停損通知", s is not None)
+    check("幣別 HOLOUSDT", s["symbol"] == "HOLOUSDT")
+    check("停損價 0.0698", s["hits"][0]["price"] == 0.0698)
+    check("完整訊號不被當成停損通知", main.parse_stop_hit(SIGNAL) is not None
+          and main.parse_signal(SIGNAL) is not None)
+    import datetime
+    out = main.format_stop_hit(s, datetime.datetime(2026, 6, 4, 12, 0, 0))
+    check("輸出用 ⛔（與訊號一致）", "⛔ 停損價1" in out)
+    check("幣別帶 #", "#HOLOUSDT" in out)
+    check("不含來源的 🛑", "🛑" not in out)
+
+
 def test_keyword_match():
     print("\n[關鍵字過濾]")
     check("命中（不分大小寫）", main._matches("這是 ENTRY 訊號") if main.KEYWORDS else True)
@@ -86,6 +104,7 @@ def main_run():
     test_parse_signal()
     test_format_signal()
     test_target_hit()
+    test_stop_hit()
     test_keyword_match()
     print("\n🎉 解析測試全部通過")
 

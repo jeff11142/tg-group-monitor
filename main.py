@@ -78,6 +78,7 @@ _SIG_SL = re.compile(r"停損價\s*(\d+)\s*[：:]\s*([\d.]+)")
 _SIG_URL = re.compile(r"https?://\S+")
 
 _HIT_TP = re.compile(r"目標價\s*(\d+)\s*[：:]\s*([\d.]+)\s*✅")
+_HIT_SL = re.compile(r"停損價\s*(\d+)\s*[：:]\s*([\d.]+)")
 
 
 def tag_symbols(text: str) -> str:
@@ -193,6 +194,32 @@ def format_target_hit(hit: dict, when: datetime) -> str:
     ]
     for h in hit["hits"]:
         lines.append(f"✅ 目標價{h['level']}: {h['price']}")
+    return tag_symbols("\n".join(lines))
+
+
+def parse_stop_hit(text: str) -> dict | None:
+    """嘗試解析「觸發停損通知」（只有停損價、沒有進場價/目標價）。沒有命中就回 None。"""
+    hits = [
+        {"level": int(m.group(1)), "price": float(m.group(2))}
+        for m in _HIT_SL.finditer(text)
+    ]
+    if not hits:
+        return None
+    m_symbol = _SYMBOL_RE.search(text)
+    if not m_symbol:
+        return None
+    return {"symbol": m_symbol.group(1), "hits": hits}
+
+
+def format_stop_hit(hit: dict, when: datetime) -> str:
+    """格式化觸發停損通知：圖示沿用訊號裡的 ⛔，版面與其他通知一致。"""
+    lines = [
+        f"⏰ {when.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"📊 幣別: {hit['symbol']}",
+        "",
+    ]
+    for h in hit["hits"]:
+        lines.append(f"⛔ 停損價{h['level']}: {h['price']}")
     return tag_symbols("\n".join(lines))
 
 
@@ -419,10 +446,13 @@ async def main() -> None:
         now_local = datetime.now(timezone.utc).astimezone()
         signal = parse_signal(text)
         target_hit = None if signal else parse_target_hit(text)
+        stop_hit = None if (signal or target_hit) else parse_stop_hit(text)
         if signal:
             formatted = format_signal(signal, now_local)
         elif target_hit:
             formatted = format_target_hit(target_hit, now_local)
+        elif stop_hit:
+            formatted = format_stop_hit(stop_hit, now_local)
         else:
             formatted = None
 
@@ -436,6 +466,7 @@ async def main() -> None:
             "text": text,
             "signal": signal,
             "target_hit": target_hit,
+            "stop_hit": stop_hit,
             "formatted": formatted,
         }
 
