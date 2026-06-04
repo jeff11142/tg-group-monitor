@@ -38,6 +38,7 @@ WEBHOOK_URL = _get("WEBHOOK_URL")
 LOG_TO_FILE = _get("LOG_TO_FILE", "1") == "1"
 LOG_FILE = _get("LOG_FILE", "messages.jsonl")
 LIST_DIALOGS = _get("LIST_DIALOGS", "0") == "1"
+TRADING_ENABLED = _get("TRADING_ENABLED", "0") == "1"
 
 
 def _parse_chat(value: str):
@@ -384,11 +385,18 @@ async def main() -> None:
             if text:
                 await _handle_admin_command(event, text)
 
+    # 啟用幣安現貨自動交易（延遲 import，沒開就不需要裝 python-binance）
+    trader = None
+    if TRADING_ENABLED:
+        import binance_trader as trader
+        trader.init()
+        await trader.resume()
+
     bot_cmd_status = f"開（admin={admin_id}）" if bot_client else "關"
     print(f"開始監聽：{SOURCE_CHAT}")
     print(f"關鍵字：{KEYWORDS or '（無，全部訊息）'}")
     print(f"Bot 轉發：{'開' if BOT_TOKEN else '關'} | Bot 指令：{bot_cmd_status} | Webhook：{'開' if WEBHOOK_URL else '關'}")
-    print(f"接收者：{recipients.count()} 筆")
+    print(f"接收者：{recipients.count()} 筆 | 自動交易：{'開' if trader else '關'}")
 
     @user_client.on(events.NewMessage(chats=source))
     async def handler(event: events.NewMessage.Event) -> None:
@@ -441,6 +449,10 @@ async def main() -> None:
 
         if WEBHOOK_URL:
             await send_webhook(http, payload)
+
+        # 只有「解析成功的進場訊號」才自動下單；目標達成通知不下單
+        if trader is not None and signal is not None:
+            await trader.on_signal(signal)
 
     try:
         coros = [user_client.run_until_disconnected()]
