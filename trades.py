@@ -36,15 +36,24 @@ def init() -> None:
                 buy_order_id INTEGER,
                 status       TEXT NOT NULL,
                 signal       TEXT NOT NULL,
-                created_at   TEXT NOT NULL
+                created_at   TEXT NOT NULL,
+                oco_orders   TEXT,
+                sl_moved     INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        # 舊 DB 遷移：補上後來新增的欄位
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+        if "oco_orders" not in cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN oco_orders TEXT")
+        if "sl_moved" not in cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN sl_moved INTEGER NOT NULL DEFAULT 0")
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     d["signal"] = json.loads(d["signal"])
+    d["oco_orders"] = json.loads(d["oco_orders"]) if d.get("oco_orders") else []
     return d
 
 
@@ -69,6 +78,18 @@ def get(trade_id: int) -> dict | None:
 def set_status(trade_id: int, status: str) -> None:
     with _conn() as conn:
         conn.execute("UPDATE trades SET status = ? WHERE id = ?", (status, trade_id))
+
+
+def set_oco(trade_id: int, oco_orders: list) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE trades SET oco_orders = ? WHERE id = ?",
+                     (json.dumps(oco_orders), trade_id))
+
+
+def update_oco(trade_id: int, oco_orders: list, sl_moved: bool) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE trades SET oco_orders = ?, sl_moved = ? WHERE id = ?",
+                     (json.dumps(oco_orders), 1 if sl_moved else 0, trade_id))
 
 
 def count_open() -> int:

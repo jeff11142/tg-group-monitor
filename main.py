@@ -391,6 +391,7 @@ async def main() -> None:
         import binance_trader as trader
         trader.init()
         await trader.resume()
+        trader.start_monitor()
 
     bot_cmd_status = f"開（admin={admin_id}）" if bot_client else "關"
     print(f"開始監聽：{SOURCE_CHAT}")

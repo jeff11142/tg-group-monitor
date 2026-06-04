@@ -32,6 +32,10 @@ SL_LIMIT_BUFFER_PCT = float(_get("SL_LIMIT_BUFFER_PCT", "0.3"))
 POLL_INTERVAL = float(_get("ENTRY_POLL_INTERVAL", "5"))
 # 賣單預留的手續費緩衝（%）：用買進數量拆單時扣掉，避免「賣超」實得數量
 FEE_BUFFER_PCT = float(_get("SELL_FEE_BUFFER_PCT", "0.1"))
+# 對帳/收單迴圈的檢查間隔（秒）
+MONITOR_INTERVAL = float(_get("TRADE_MONITOR_INTERVAL", "15"))
+# 是否在第一個止盈成交後，把剩餘止損移到保本（進場價）
+BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
 
 _client: Client | None = None
 _filters_cache: dict = {}
@@ -205,13 +209,14 @@ async def _place_oco_grid(trade: dict) -> None:
         allocated += qty_i
         portions.append(qty_i)
 
+    placed = []
     for i in range(n):
         qty_i = portions[i]
         if qty_i <= 0:
             continue
         tp_price = _quantize(targets[i]["price"], filt["tick"])
         # 新版 OCO endpoint（orderList/oco）：SELL 時 above=止盈(LIMIT_MAKER)、below=止損(STOP_LOSS_LIMIT)
-        await _api(
+        resp = await _api(
             _client.create_oco_order,
             symbol=symbol,
             side="SELL",
@@ -223,7 +228,15 @@ async def _place_oco_grid(trade: dict) -> None:
             belowPrice=format(sl_limit, "f"),
             belowTimeInForce="GTC",
         )
+        placed.append({
+            "list_id": resp["orderListId"],
+            "qty": float(qty_i),
+            "tp": float(tp_price),
+            "level": i + 1,
+        })
         print(f"[trader]   OCO{i + 1}: 賣 {qty_i} @ TP {tp_price} / SL {sl_trigger}")
+
+    trades.set_oco(trade["id"], placed)
 
 
 async def resume() -> None:
@@ -231,3 +244,89 @@ async def resume() -> None:
     for t in trades.list_status("PENDING_BUY"):
         print(f"[trader] 回復未完成交易 trade#{t['id']} {t['symbol']}，繼續等待成交…")
         asyncio.create_task(_watch_and_protect(t["id"]))
+
+
+def start_monitor() -> None:
+    """啟動背景對帳迴圈：自動收單（#1）+ TP1 後移動停損到保本（#2）。"""
+    asyncio.create_task(_monitor_loop())
+    print(f"[trader] 對帳迴圈啟動（每 {MONITOR_INTERVAL:g} 秒）"
+          f"{'，TP1 後移動停損到保本' if BREAKEVEN_AFTER_TP1 else ''}")
+
+
+async def _monitor_loop() -> None:
+    while True:
+        try:
+            for trade in trades.list_status("ACTIVE"):
+                await _reconcile(trade)
+        except Exception as e:
+            print(f"[trader] 對帳迴圈錯誤：{e}")
+        await asyncio.sleep(MONITOR_INTERVAL)
+
+
+async def _reconcile(trade: dict) -> None:
+    """檢查一筆 ACTIVE 交易：全平就收單；部分止盈就把剩餘止損移到保本。"""
+    symbol = trade["symbol"]
+    legs = trade.get("oco_orders") or []
+    open_orders = await _api(_client.get_open_orders, symbol=symbol)
+
+    if not legs:
+        # 舊資料沒記 OCO（功能上線前的交易）：沒有未結單就視為已結束
+        if not open_orders:
+            trades.set_status(trade["id"], "CLOSED")
+            print(f"[trader] trade#{trade['id']} {symbol} 已結束 → CLOSED")
+        return
+
+    open_list_ids = {o["orderListId"] for o in open_orders}
+    still_open = [lg for lg in legs if lg["list_id"] in open_list_ids]
+
+    # #1 自動收單：全部 OCO 都不在了 = 整筆平倉完成
+    if not still_open:
+        trades.set_status(trade["id"], "CLOSED")
+        print(f"[trader] trade#{trade['id']} {symbol} 全部平倉 → CLOSED（釋放持倉額度）")
+        return
+
+    # #2 移動停損到保本：有些已平、有些還在 → 已平者必為止盈（止損會一次掃全部）
+    if (BREAKEVEN_AFTER_TP1 and not trade.get("sl_moved")
+            and len(still_open) < len(legs)):
+        await _move_sl_to_breakeven(trade, still_open, open_orders)
+
+
+async def _move_sl_to_breakeven(trade: dict, still_open: list, open_orders: list) -> None:
+    """把仍掛著的 OCO 撤掉重掛，止盈不變、止損改到進場價（保本）。"""
+    symbol = trade["symbol"]
+    filt = await _get_filters(symbol)
+    entry = Decimal(str(trade["entry"]))
+
+    ticker = await _api(_client.get_symbol_ticker, symbol=symbol)
+    price = Decimal(ticker["price"])
+    if entry >= price:
+        return  # 已回落到進場價附近，設保本會讓止損高於市價（OCO 不合法），維持原止損
+
+    be_trigger = _quantize(float(entry), filt["tick"])
+    be_limit = _quantize(float(entry * Decimal(str(1 - SL_LIMIT_BUFFER_PCT / 100))), filt["tick"])
+    order_by_list = {}
+    for o in open_orders:
+        order_by_list.setdefault(o["orderListId"], o)
+
+    still_ids = {s["list_id"] for s in still_open}
+    legs = [dict(lg) for lg in trade["oco_orders"]]
+    for lg in legs:
+        if lg["list_id"] not in still_ids:
+            continue
+        o = order_by_list.get(lg["list_id"])
+        if not o:
+            continue
+        # 撤掉舊 OCO（撤一腿即連帶取消整組），再用相同止盈、保本止損重掛
+        await _api(_client.cancel_order, symbol=symbol, orderId=o["orderId"])
+        resp = await _api(
+            _client.create_oco_order, symbol=symbol, side="SELL",
+            quantity=format(_quantize(lg["qty"], filt["step"]), "f"),
+            aboveType="LIMIT_MAKER", abovePrice=format(_quantize(lg["tp"], filt["tick"]), "f"),
+            belowType="STOP_LOSS_LIMIT",
+            belowStopPrice=format(be_trigger, "f"), belowPrice=format(be_limit, "f"),
+            belowTimeInForce="GTC",
+        )
+        lg["list_id"] = resp["orderListId"]
+
+    trades.update_oco(trade["id"], legs, sl_moved=True)
+    print(f"[trader] trade#{trade['id']} {symbol} 止盈已觸發，剩餘 {len(still_open)} 組止損移到保本 {be_trigger}")
