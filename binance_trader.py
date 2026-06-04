@@ -80,7 +80,8 @@ def init() -> None:
     trades.init()
     net = "TESTNET 測試網" if TESTNET else "⚠️ 正式網（真錢）"
     market = f"合約 {LEVERAGE}x {MARGIN_TYPE} {TRADE_SIDE}" if FUTURES else "現貨 LONG"
-    print(f"[trader] 幣安自動交易啟用：{market} | {net} | 每筆 {TRADE_USDT} USDT | "
+    amount_desc = "依交易對自動取最小" if AUTO_MIN_AMOUNT else f"固定 {TRADE_USDT} USDT"
+    print(f"[trader] 幣安自動交易啟用：{market} | {net} | 每筆 {amount_desc} | "
           f"最多同時 {MAX_OPEN_TRADES} 筆 | 分批 {TP_RATIOS}")
 
 
