@@ -80,6 +80,11 @@ def set_status(trade_id: int, status: str) -> None:
         conn.execute("UPDATE trades SET status = ? WHERE id = ?", (status, trade_id))
 
 
+def set_qty(trade_id: int, qty: float) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE trades SET qty = ? WHERE id = ?", (qty, trade_id))
+
+
 def set_oco(trade_id: int, oco_orders: list) -> None:
     with _conn() as conn:
         conn.execute("UPDATE trades SET oco_orders = ? WHERE id = ?",

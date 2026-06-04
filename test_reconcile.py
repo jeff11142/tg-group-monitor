@@ -23,6 +23,12 @@ class FakeClient:
         self.canceled = []         # 被撤掉的 orderId
         self.created = []          # 新掛的 OCO 參數
         self._next_list_id = 1000
+        self.order_status = "FILLED"   # 控制 get_order 回傳的買單狀態
+        self.executed_qty = "0"        # 控制買單已成交數量
+
+    def get_order(self, symbol, orderId):
+        return {"status": self.order_status, "executedQty": self.executed_qty,
+                "orderId": orderId}
 
     def get_symbol_info(self, symbol):
         return {"baseAsset": "BTC", "quoteAsset": "USDT", "filters": [
@@ -137,6 +143,48 @@ async def scenario_pullback_no_move():
     check("sl_moved 維持 0", t["sl_moved"] == 0)
 
 
+async def scenario_entry_timeout_cancel():
+    print("\n[情境5] 限價買單超時未成交 → 撤單取消（釋放額度）")
+    fake = bt._client = FakeClient()
+    fake.order_status, fake.executed_qty = "NEW", "0"
+    bt._filters_cache.clear()
+    old_to, old_poll = bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL
+    bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL = 0.05, 0.02
+    try:
+        tid = trades.add("BTCUSDT", 63000, 0.0008, 555, {"symbol": "BTCUSDT"})
+        await bt._watch_and_protect(tid, initial_status="NEW")
+        t = trades.get(tid)
+        check("買單被撤掉", len(fake.canceled) == 1)
+        check("交易標記 CANCELED", t["status"] == "CANCELED")
+        check("不再佔 open 額度", t["id"] not in
+              {x["id"] for x in trades.list_status("PENDING_BUY") + trades.list_status("ACTIVE")})
+    finally:
+        bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL = old_to, old_poll
+
+
+async def scenario_entry_timeout_partial():
+    print("\n[情境6] 限價買單超時但已部分成交 → 保護部分倉位")
+    fake = bt._client = FakeClient()
+    fake.order_status, fake.executed_qty = "PARTIALLY_FILLED", "0.00050"
+    bt._filters_cache.clear()
+    old_to, old_poll = bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL
+    bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL = 0.05, 0.02
+    try:
+        sig = {"symbol": "BTCUSDT", "entry": 63000,
+               "targets": [{"level": i + 1, "price": 63000 * (1 + 0.01 * (i + 1)), "pct": 0}
+                           for i in range(4)],
+               "stops": [{"level": 1, "price": 62000, "pct": 0}]}
+        tid = trades.add("BTCUSDT", 63000, 0.0008, 556, sig)
+        await bt._watch_and_protect(tid, initial_status="PARTIALLY_FILLED")
+        t = trades.get(tid)
+        check("未成交部分被撤", len(fake.canceled) == 1)
+        check("改用實際成交量 0.0005", abs(t["qty"] - 0.0005) < 1e-9)
+        check("已掛 OCO 保護部分倉位", len(fake.created) >= 1)
+        check("交易進入 ACTIVE", t["status"] == "ACTIVE")
+    finally:
+        bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL = old_to, old_poll
+
+
 async def main():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
@@ -144,6 +192,8 @@ async def main():
     await scenario_tp1_breakeven()
     await scenario_breakeven_then_close()
     await scenario_pullback_no_move()
+    await scenario_entry_timeout_cancel()
+    await scenario_entry_timeout_partial()
     print("\n🎉 全部對帳邏輯測試通過")
 
 

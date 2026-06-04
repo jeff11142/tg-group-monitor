@@ -10,6 +10,7 @@
 
 import asyncio
 import os
+import time
 from decimal import ROUND_DOWN, Decimal
 
 from binance.client import Client
@@ -36,6 +37,9 @@ FEE_BUFFER_PCT = float(_get("SELL_FEE_BUFFER_PCT", "0.1"))
 MONITOR_INTERVAL = float(_get("TRADE_MONITOR_INTERVAL", "15"))
 # 是否在第一個止盈成交後，把剩餘止損移到保本（進場價）
 BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
+# 限價買單超過幾分鐘未成交就撤單、釋放持倉額度（0=永不超時，一直等成交）
+ENTRY_TIMEOUT_MIN = float(_get("ENTRY_TIMEOUT_MIN", "30"))
+ENTRY_TIMEOUT_SEC = ENTRY_TIMEOUT_MIN * 60
 
 _client: Client | None = None
 _filters_cache: dict = {}
@@ -149,6 +153,7 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
         order_id = trade["buy_order_id"]
 
         if initial_status != "FILLED":
+            deadline = time.monotonic() + ENTRY_TIMEOUT_SEC if ENTRY_TIMEOUT_SEC > 0 else None
             # 剛下單時 testnet 可能因複寫延遲回 -2013（其實單子在），容忍重試
             not_found = 0
             await asyncio.sleep(1.0)
@@ -168,6 +173,12 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
                     trades.set_status(tid, "CANCELED")
                     print(f"[trader] {symbol} 買單未成交（{status}），trade#{tid} 取消")
                     return
+                if deadline and time.monotonic() >= deadline:
+                    # 超時：撤掉買單，釋放持倉額度；若已部分成交則保護已成交的部分
+                    if await _handle_entry_timeout(tid, symbol, order_id, order):
+                        trade = trades.get(tid)  # 用更新後的成交量重新取 trade
+                        break
+                    return
                 await asyncio.sleep(POLL_INTERVAL)
 
         await _place_oco_grid(trade)
@@ -177,6 +188,30 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
         print(f"[trader] trade#{tid} 掛 OCO 失敗：{e.status_code} {e.message}")
     except Exception as e:
         print(f"[trader] trade#{tid} 監控失敗：{e}")
+
+
+async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dict) -> bool:
+    """限價買單超時：撤單釋放額度。回傳是否「有可觀的部分成交、需改掛 OCO 保護」。"""
+    try:
+        await _api(_client.cancel_order, symbol=symbol, orderId=order_id)
+    except BinanceAPIException as e:
+        if e.code != -2011:  # -2011 = 訂單已不存在（剛好成交/已撤），忽略
+            raise
+
+    filt = await _get_filters(symbol)
+    executed = _quantize(float(order.get("executedQty", 0) or 0), filt["step"])
+    price = Decimal(str(trades.get(tid)["entry"]))
+
+    if executed >= filt["min_qty"] and executed * price >= filt["min_notional"]:
+        # 已部分成交且量足夠拆單 → 用實際成交量保護
+        trades.set_qty(tid, float(executed))
+        print(f"[trader] {symbol} 買單超時，已部分成交 {executed}，改用實際量掛 OCO（trade#{tid}）")
+        return True
+
+    trades.set_status(tid, "CANCELED")
+    mins = ENTRY_TIMEOUT_MIN
+    print(f"[trader] {symbol} 買單超過 {mins:g} 分鐘未成交，已撤單，trade#{tid} 取消（釋放額度）")
+    return False
 
 
 async def _place_oco_grid(trade: dict) -> None:
