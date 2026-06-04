@@ -25,6 +25,9 @@ def _get(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
+_http: "httpx.AsyncClient | None" = None  # 供 bot 指令處理共用的 HTTP client
+
+
 API_ID = _get("API_ID")
 API_HASH = _get("API_HASH")
 PHONE = _get("PHONE")
@@ -39,6 +42,12 @@ LOG_TO_FILE = _get("LOG_TO_FILE", "1") == "1"
 LOG_FILE = _get("LOG_FILE", "messages.jsonl")
 LIST_DIALOGS = _get("LIST_DIALOGS", "0") == "1"
 TRADING_ENABLED = _get("TRADING_ENABLED", "0") == "1"
+# 訂閱服務（USDT 付款，管理員手動確認後 /sub 開通）
+SUB_PRICE_USDT = _get("SUB_PRICE_USDT", "30")
+SUB_DAYS = _get("SUB_DAYS", "30")
+SUB_NETWORK = _get("SUB_NETWORK", "TRC20")
+SUB_WALLET = _get("SUB_WALLET")
+SUB_CHECK_INTERVAL = int(_get("SUB_CHECK_INTERVAL", "300"))
 
 
 def _parse_chat(value: str):
@@ -230,46 +239,96 @@ async def list_dialogs(client: TelegramClient) -> None:
         print(f"[{kind}] {dialog.name!r}  id={dialog.id}")
 
 
+async def send_bot_dm(http: httpx.AsyncClient, chat_id: int, text: str) -> bool:
+    """用 TG Bot 私訊單一 chat_id，回傳是否成功。"""
+    try:
+        resp = await http.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[bot 發送失敗 {chat_id}] {data.get('description')}")
+        return bool(data.get("ok"))
+    except Exception as e:  # 不讓單次失敗中斷監聽
+        print(f"[bot 發送失敗 {chat_id}] {e}")
+        return False
+
+
 async def broadcast_via_bot(http: httpx.AsyncClient, text: str) -> None:
-    """用 TG Bot 廣播給 recipients 表中所有 enabled 的接收者。"""
-    ids = recipients.list_enabled_ids()
+    """用 TG Bot 廣播給「已啟用且未到期」的訂閱者。"""
+    ids = recipients.list_active_ids()
     if not ids:
-        print("[broadcast] 沒有任何 enabled 接收者，訊息略過")
+        print("[broadcast] 沒有任何有效訂閱者，訊息略過")
         return
     for chat_id in ids:
+        await send_bot_dm(http, chat_id, text)
+
+
+async def _subscription_loop() -> None:
+    """定期檢查訂閱到期：過期者停用、推播停止，並通知本人。"""
+    while True:
         try:
-            resp = await http.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-            )
-            data = resp.json()
-            if not data.get("ok"):
-                print(f"[bot 轉發失敗 {chat_id}] {data.get('description')}")
-        except Exception as e:  # 不讓單次失敗中斷監聽
-            print(f"[bot 轉發失敗 {chat_id}] {e}")
+            for r in recipients.due_expired():
+                recipients.set_enabled(r["chat_id"], False)
+                print(f"[訂閱] {r['chat_id']} 已到期，停止推播")
+                if _http is not None:
+                    await send_bot_dm(_http, r["chat_id"],
+                                      "⌛ 你的訂閱已到期，已停止訊號推播。\n"
+                                      "若要續訂，請私訊本 bot 取得付款資訊。")
+        except Exception as e:
+            print(f"[訂閱] 到期檢查錯誤：{e}")
+        await asyncio.sleep(SUB_CHECK_INTERVAL)
 
 
 ADMIN_HELP_TEXT = (
     "管理員指令：\n"
+    "/sub <chat_id> <天數> [name] — 開通/續期訂閱\n"
+    "/unsub <chat_id> — 停用訂閱\n"
+    "/subs — 列出訂閱者與到期狀態\n"
     "/list — 列出所有接收者\n"
-    "/add <chat_id> [name] — 新增接收者\n"
+    "/add <chat_id> [name] — 新增（無期限）接收者\n"
     "/remove <chat_id> — 移除接收者\n"
     "/enable <chat_id> — 啟用接收者\n"
     "/disable <chat_id> — 暫停接收者\n"
     "/myid — 顯示自己的 chat_id\n"
     "/help — 顯示此說明"
 )
-NON_ADMIN_HINT = (
-    "你好！\n"
-    "你的 chat_id 是 {chat_id}\n"
-    "要接收訊號通知，請把這個 chat_id 給管理員開通。"
-)
+
+
+def _remaining_text(expires_at: str | None) -> str:
+    """把到期日轉成人看得懂的剩餘天數描述。"""
+    if not expires_at:
+        return "永久"
+    exp = datetime.fromisoformat(expires_at)
+    now = datetime.now(timezone.utc)
+    if exp <= now:
+        return "已到期"
+    days = (exp - now).days
+    return f"到 {exp.astimezone().strftime('%Y-%m-%d')}（剩 {days} 天）"
+
+
+def subscription_hint(chat_id: int) -> str:
+    """非管理員私訊 bot 時的回覆：chat_id + 訂閱狀態 / 付款指引。"""
+    r = recipients.get(chat_id)
+    lines = ["你好！", f"你的 chat_id 是 {chat_id}", ""]
+    if r and r["enabled"] and (r["expires_at"] is None or
+                               datetime.fromisoformat(r["expires_at"]) > datetime.now(timezone.utc)):
+        lines.append(f"✅ 你的訂閱狀態：{_remaining_text(r['expires_at'])}")
+    else:
+        lines.append(f"📦 訂閱方案：{SUB_PRICE_USDT} USDT / {SUB_DAYS} 天")
+        if SUB_WALLET:
+            lines.append(f"💰 轉帳 USDT（{SUB_NETWORK}）到：")
+            lines.append(SUB_WALLET)
+        lines.append("")
+        lines.append(f"付款後請把「你的 chat_id（{chat_id}）」與交易截圖 / TxID 傳給管理員，即可開通。")
+    return "\n".join(lines)
 
 
 def _format_recipient_line(r: dict) -> str:
     flag = "✅" if r["enabled"] else "⏸️"
     name = f" ({r['name']})" if r.get("name") else ""
-    return f"{flag} {r['chat_id']}{name}"
+    return f"{flag} {r['chat_id']}{name} — {_remaining_text(r.get('expires_at'))}"
 
 
 async def _handle_admin_command(event, text: str) -> None:
@@ -292,6 +351,54 @@ async def _handle_admin_command(event, text: str) -> None:
 
     if cmd == "/help":
         await event.reply(ADMIN_HELP_TEXT)
+        return
+
+    if cmd == "/subs":
+        items = recipients.list_all()
+        if not items:
+            await event.reply("(尚無訂閱者)")
+            return
+        lines = [f"訂閱者（共 {len(items)} 筆）："]
+        lines.extend(_format_recipient_line(r) for r in items)
+        await event.reply("\n".join(lines))
+        return
+
+    if cmd == "/sub":
+        if len(parts) < 3:
+            await event.reply("用法：/sub <chat_id> <天數> [name]")
+            return
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await event.reply(f"chat_id 必須是數字，收到：{parts[1]!r}")
+            return
+        rest = parts[2].split(None, 1)
+        try:
+            days = int(rest[0])
+        except ValueError:
+            await event.reply(f"天數必須是數字，收到：{rest[0]!r}")
+            return
+        name = rest[1].strip() if len(rest) > 1 else None
+        new_exp = recipients.subscribe(target_id, days, name)
+        await event.reply(f"已開通 {target_id} +{days} 天，{_remaining_text(new_exp)}")
+        # 通知訂閱者本人（若曾與 bot 互動過）
+        await send_bot_dm(_http, target_id,
+                          f"✅ 訂閱已開通／續期！{_remaining_text(new_exp)}\n你將開始收到訊號通知。")
+        return
+
+    if cmd == "/unsub":
+        if len(parts) < 2:
+            await event.reply("用法：/unsub <chat_id>")
+            return
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await event.reply(f"chat_id 必須是數字，收到：{parts[1]!r}")
+            return
+        if recipients.set_enabled(target_id, False):
+            await event.reply(f"已停用 {target_id} 的訂閱")
+        else:
+            await event.reply(f"找不到 {target_id}")
         return
 
     if cmd in ("/add", "/remove", "/enable", "/disable"):
@@ -385,7 +492,8 @@ async def main() -> None:
     if source is None:
         raise SystemExit("未設定 SOURCE_CHAT（要監聽的群組）。先把 LIST_DIALOGS=1 跑一次找 id。")
 
-    http = httpx.AsyncClient(timeout=10)
+    global _http
+    http = _http = httpx.AsyncClient(timeout=10)
 
     # 啟動 bot 客戶端（收 admin 指令、回覆非 admin）
     bot_client: TelegramClient | None = None
@@ -406,11 +514,15 @@ async def main() -> None:
             if not event.is_private:
                 return  # 忽略群組/頻道訊息
             if event.sender_id != admin_id:
-                await event.reply(NON_ADMIN_HINT.format(chat_id=event.sender_id))
+                await event.reply(subscription_hint(event.sender_id))
                 return
             text = (event.message.message or "").strip()
             if text:
                 await _handle_admin_command(event, text)
+
+    # 訂閱到期背景檢查：過期自動停推並通知本人
+    if BOT_TOKEN:
+        asyncio.create_task(_subscription_loop())
 
     # 啟用幣安現貨自動交易（延遲 import，沒開就不需要裝 python-binance）
     trader = None
