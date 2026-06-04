@@ -210,15 +210,18 @@ async def _place_oco_grid(trade: dict) -> None:
         if qty_i <= 0:
             continue
         tp_price = _quantize(targets[i]["price"], filt["tick"])
+        # 新版 OCO endpoint（orderList/oco）：SELL 時 above=止盈(LIMIT_MAKER)、below=止損(STOP_LOSS_LIMIT)
         await _api(
             _client.create_oco_order,
             symbol=symbol,
             side="SELL",
             quantity=format(qty_i, "f"),
-            price=format(tp_price, "f"),
-            stopPrice=format(sl_trigger, "f"),
-            stopLimitPrice=format(sl_limit, "f"),
-            stopLimitTimeInForce="GTC",
+            aboveType="LIMIT_MAKER",
+            abovePrice=format(tp_price, "f"),
+            belowType="STOP_LOSS_LIMIT",
+            belowStopPrice=format(sl_trigger, "f"),
+            belowPrice=format(sl_limit, "f"),
+            belowTimeInForce="GTC",
         )
         print(f"[trader]   OCO{i + 1}: 賣 {qty_i} @ TP {tp_price} / SL {sl_trigger}")
 
