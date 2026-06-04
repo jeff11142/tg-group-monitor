@@ -43,6 +43,8 @@ ENTRY_TIMEOUT_SEC = ENTRY_TIMEOUT_MIN * 60
 
 _client: Client | None = None
 _filters_cache: dict = {}
+# 進場鎖：序列化「檢查額度→下單→建檔」，避免多訊號同時湧入時超開過 MAX_OPEN_TRADES
+_entry_lock = asyncio.Lock()
 
 
 def init() -> None:
@@ -110,39 +112,41 @@ async def _on_signal(signal: dict) -> None:
         print(f"[trader] 訊號缺必要欄位（symbol/entry/targets/stops），略過：{symbol}")
         return
 
-    if trades.count_open() >= MAX_OPEN_TRADES:
-        print(f"[trader] 已達最大同時持倉 {MAX_OPEN_TRADES}，略過 {symbol}")
-        return
-    if trades.has_open_symbol(symbol):
-        print(f"[trader] {symbol} 已有未結倉，略過重複進場")
-        return
+    # 進場鎖：序列化額度檢查與下單，避免多訊號並發時超開
+    async with _entry_lock:
+        if trades.count_open() >= MAX_OPEN_TRADES:
+            print(f"[trader] 已達最大同時持倉 {MAX_OPEN_TRADES}，略過 {symbol}")
+            return
+        if trades.has_open_symbol(symbol):
+            print(f"[trader] {symbol} 已有未結倉，略過重複進場")
+            return
 
-    filt = await _get_filters(symbol)
-    if not filt:
-        print(f"[trader] 找不到交易對 {symbol}（testnet 可能不支援），略過")
-        return
+        filt = await _get_filters(symbol)
+        if not filt:
+            print(f"[trader] 找不到交易對 {symbol}（testnet 可能不支援），略過")
+            return
 
-    price = _quantize(entry, filt["tick"])
-    qty = _quantize(TRADE_USDT / float(price), filt["step"])
-    if qty < filt["min_qty"] or qty * price < filt["min_notional"]:
-        print(f"[trader] {symbol} 下單量太小（qty={qty}），請調高 TRADE_USDT，略過")
-        return
+        price = _quantize(entry, filt["tick"])
+        qty = _quantize(TRADE_USDT / float(price), filt["step"])
+        if qty < filt["min_qty"] or qty * price < filt["min_notional"]:
+            print(f"[trader] {symbol} 下單量太小（qty={qty}），請調高 TRADE_USDT，略過")
+            return
 
-    # 預檢：分批後最小一份是否仍滿足最小金額（否則 OCO 會被幣安拒絕）
-    smallest = Decimal(str(min(TP_RATIOS))) / Decimal(str(sum(TP_RATIOS)))
-    if qty * price * smallest < filt["min_notional"]:
-        print(f"[trader] {symbol} 分批後最小一份 < 最小金額 {filt['min_notional']}，"
-              f"請調高 TRADE_USDT，略過")
-        return
+        # 預檢：分批後最小一份是否仍滿足最小金額（否則 OCO 會被幣安拒絕）
+        smallest = Decimal(str(min(TP_RATIOS))) / Decimal(str(sum(TP_RATIOS)))
+        if qty * price * smallest < filt["min_notional"]:
+            print(f"[trader] {symbol} 分批後最小一份 < 最小金額 {filt['min_notional']}，"
+                  f"請調高 TRADE_USDT，略過")
+            return
 
-    order = await _api(_client.order_limit_buy, symbol=symbol,
-                       quantity=_qstr(float(qty), filt["step"]),
-                       price=_qstr(float(price), filt["tick"]))
-    buy_id = order["orderId"]
-    tid = trades.add(symbol=symbol, entry=float(price), qty=float(qty),
-                     buy_order_id=buy_id, signal=signal)
-    print(f"[trader] {symbol} 限價買單已掛 @ {price}（qty={qty}，trade#{tid}），等待成交…")
-    asyncio.create_task(_watch_and_protect(tid, order.get("status", "")))
+        order = await _api(_client.order_limit_buy, symbol=symbol,
+                           quantity=_qstr(float(qty), filt["step"]),
+                           price=_qstr(float(price), filt["tick"]))
+        buy_id = order["orderId"]
+        tid = trades.add(symbol=symbol, entry=float(price), qty=float(qty),
+                         buy_order_id=buy_id, signal=signal)
+        print(f"[trader] {symbol} 限價買單已掛 @ {price}（qty={qty}，trade#{tid}），等待成交…")
+        asyncio.create_task(_watch_and_protect(tid, order.get("status", "")))
 
 
 async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
