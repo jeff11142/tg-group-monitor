@@ -7,6 +7,8 @@ Wants=network-online.target
 Type=simple
 # 改成你 VPS 上實際的使用者與路徑
 User=ubuntu
+# 讓 Python print 即時寫進 journal（否則輸出會被緩衝、journalctl 看不到）
+Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/opt/tg-group-monitor
 ExecStart=/opt/tg-group-monitor/.venv/bin/python /opt/tg-group-monitor/main.py
 Restart=always
