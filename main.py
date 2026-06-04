@@ -271,6 +271,9 @@ ADMIN_COMMANDS = [
     {"command": "myid", "description": "顯示你的 chat_id"},
     {"command": "help", "description": "顯示管理指令說明"},
 ]
+# 管理專用指令（非管理員輸入這些 → 靜默忽略，不回覆）
+ADMIN_ONLY_CMDS = ({"/" + c["command"] for c in ADMIN_COMMANDS}
+                   - {"/" + c["command"] for c in PUBLIC_COMMANDS})
 
 
 async def setup_bot_commands(http: httpx.AsyncClient, admin_id: int | None) -> None:
@@ -548,10 +551,13 @@ async def main() -> None:
         async def _bot_router(event):
             if not event.is_private:
                 return  # 忽略群組/頻道訊息
+            text = (event.message.message or "").strip()
             if event.sender_id != admin_id:
+                cmd = text.split()[0].lower().split("@")[0] if text else ""
+                if cmd in ADMIN_ONLY_CMDS:
+                    return  # 非管理員輸入管理指令 → 無權限，靜默忽略不回覆
                 await event.reply(subscription_hint(event.sender_id))
                 return
-            text = (event.message.message or "").strip()
             if text:
                 await _handle_admin_command(event, text)
 
