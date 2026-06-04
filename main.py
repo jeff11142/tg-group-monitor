@@ -60,7 +60,14 @@ def _matches(text: str) -> bool:
     return any(k in low for k in KEYWORDS)
 
 
-_SIG_SYMBOL = re.compile(r"#(\w+)")
+# 報價幣別（交易對結尾），要支援更多就往這裡加
+_QUOTE_CURRENCIES = ("USDT", "USDC", "USD", "BUSD", "FDUSD", "TUSD", "DAI")
+_QUOTE_ALT = "|".join(_QUOTE_CURRENCIES)
+# 交易對符號：基礎幣 + 報價幣（如 VICUSDT、BTCUSDC），前置 # 可有可無
+_SYMBOL_RE = re.compile(rf"#?([A-Z0-9]{{2,15}}(?:{_QUOTE_ALT}))\b")
+# 在文字中找出「還沒加 #」的交易對（負向回顧避免重複加、避免咬到 URL 內部）
+_COIN_RE = re.compile(rf"(?<![#\w])([A-Z0-9]{{2,15}}(?:{_QUOTE_ALT}))\b")
+
 _SIG_VOL = re.compile(r"成交量排名[：:]\s*(\d+)\w*\s*/\s*(\d+)")
 _SIG_CAP = re.compile(r"市值[：:]\s*([\d.]+[KMB]?)")
 _SIG_RISK = re.compile(r"風險等級[：:]\s*([^\n]+)")
@@ -70,12 +77,25 @@ _SIG_SL = re.compile(r"停損價\s*(\d+)\s*[：:]\s*([\d.]+)")
 _SIG_URL = re.compile(r"https?://\S+")
 
 _HIT_TP = re.compile(r"目標價\s*(\d+)\s*[：:]\s*([\d.]+)\s*✅")
-_HIT_SYMBOL = re.compile(r"#?(\b[A-Z][A-Z0-9_]{2,}\b)")
+
+
+def tag_symbols(text: str) -> str:
+    """文字中出現 XXXUSDT / XXXUSDC 等交易對、且前面還沒有 # 時自動補上 #；URL 內不更動。"""
+    def _sub(seg: str) -> str:
+        return _COIN_RE.sub(r"#\1", seg)
+
+    out, last = [], 0
+    for m in _SIG_URL.finditer(text):
+        out.append(_sub(text[last:m.start()]))
+        out.append(m.group(0))  # URL 原樣保留，不在裡面加 #
+        last = m.end()
+    out.append(_sub(text[last:]))
+    return "".join(out)
 
 
 def parse_signal(text: str) -> dict | None:
     """嘗試把訊號訊息解析成結構化資料。沒命中 symbol+entry 就回 None（代表不是訊號）。"""
-    m_symbol = _SIG_SYMBOL.search(text)
+    m_symbol = _SYMBOL_RE.search(text)
     m_entry = _SIG_ENTRY.search(text)
     if not (m_symbol and m_entry):
         return None
@@ -118,7 +138,7 @@ def format_signal(signal: dict, when: datetime) -> str:
     """把結構化訊號格式化成自訂版面。"""
     lines = [
         f"⏰ {when.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"📊 幣別: #{signal['symbol']}",
+        f"📊 幣別: {signal['symbol']}",
     ]
     if "risk" in signal:
         lines.append(f"💡 風險: {signal['risk']}")
@@ -146,7 +166,7 @@ def format_signal(signal: dict, when: datetime) -> str:
     if "url" in signal:
         lines.append("")
         lines.append(f"🔗 {signal['url']}")
-    return "\n".join(lines)
+    return tag_symbols("\n".join(lines))
 
 
 def parse_target_hit(text: str) -> dict | None:
@@ -157,7 +177,7 @@ def parse_target_hit(text: str) -> dict | None:
     ]
     if not hits:
         return None
-    m_symbol = _HIT_SYMBOL.search(text)
+    m_symbol = _SYMBOL_RE.search(text)
     if not m_symbol:
         return None
     return {"symbol": m_symbol.group(1), "hits": hits}
@@ -167,12 +187,12 @@ def format_target_hit(hit: dict, when: datetime) -> str:
     """格式化目標達成通知：每個達成的目標自己一行，✅ 開頭。"""
     lines = [
         f"⏰ {when.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"📊 幣別: #{hit['symbol']}",
+        f"📊 幣別: {hit['symbol']}",
         "",
     ]
     for h in hit["hits"]:
         lines.append(f"✅ 目標價{h['level']}: {h['price']}")
-    return "\n".join(lines)
+    return tag_symbols("\n".join(lines))
 
 
 async def list_dialogs(client: TelegramClient) -> None:
@@ -417,7 +437,7 @@ async def main() -> None:
 
         # 用 Bot 廣播給 recipients 表中所有 enabled 接收者；訊號訊息用自訂格式，其他訊息原樣轉發
         if BOT_TOKEN:
-            await broadcast_via_bot(http, formatted or text)
+            await broadcast_via_bot(http, formatted or tag_symbols(text))
 
         if WEBHOOK_URL:
             await send_webhook(http, payload)
