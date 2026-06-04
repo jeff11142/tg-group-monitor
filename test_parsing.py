@@ -130,6 +130,45 @@ def test_reject_invalid():
     check("市場提醒不當成停損", main.parse_stop_hit(MARKET_ALERT) is None)
 
 
+# 真實來源訊號（含風險說明多行、TP4 字樣、URL），完整驗證解析穩定
+VELVET_SOURCE = """🆕 #VELVETUSDT
+
+24 小時成交量排名: 272th/580
+市值: 42.21M
+
+風險等級：⚠️ 較高
+ - 成交量排名在前 200 名之外。
+ - 相同標的在 24 小時內已達成 TP4。
+ - 市值低於 50M。
+
+➡️ 進場價: 0.1162
+
+🎯 目標價 1: 0.1196
+🎯 目標價 2: 0.1230
+🎯 目標價 3: 0.1333
+🎯 目標價 4: 0.1504
+
+🛑 停損價 1: 0.1082
+🛑 停損價 2: 0.0888
+
+📊 https://www.tradingview.com/chart?symbol=BINANCE%3AVELVETUSDT.P"""
+
+
+def test_real_signal():
+    print("\n[真實來源訊號 VELVET]")
+    s = main.parse_signal(VELVET_SOURCE)
+    check("有解析到", s is not None)
+    check("幣別 VELVETUSDT", s["symbol"] == "VELVETUSDT")
+    check("進場 0.1162", s["entry"] == 0.1162)
+    check("4 個目標", len(s["targets"]) == 4)
+    check("目標4 = 0.1504", s["targets"][3]["price"] == 0.1504)
+    check("2 個停損", len(s["stops"]) == 2)
+    check("SL1 = 0.1082", s["stops"][0]["price"] == 0.1082)
+    check("風險只取等級行（不含說明列）", s.get("risk") == "⚠️ 較高")
+    check("成交量排名 272/580", s.get("volume_rank") == "272/580")
+    check("「達成 TP4」字樣不誤抓成目標", len(s["targets"]) == 4)
+
+
 def test_keyword_match():
     print("\n[關鍵字過濾]")
     check("命中（不分大小寫）", main._matches("這是 ENTRY 訊號") if main.KEYWORDS else True)
@@ -143,6 +182,7 @@ def main_run():
     test_target_hit()
     test_stop_hit()
     test_reject_invalid()
+    test_real_signal()
     test_keyword_match()
     print("\n🎉 解析測試全部通過")
 
