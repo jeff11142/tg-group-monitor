@@ -30,6 +30,8 @@ MAX_OPEN_TRADES = int(_get("MAX_OPEN_TRADES", "5"))
 TP_RATIOS = [float(x) for x in _get("TP_RATIOS", "30,30,20,20").split(",") if x.strip()]
 SL_LIMIT_BUFFER_PCT = float(_get("SL_LIMIT_BUFFER_PCT", "0.3"))
 POLL_INTERVAL = float(_get("ENTRY_POLL_INTERVAL", "5"))
+# 賣單預留的手續費緩衝（%）：用買進數量拆單時扣掉，避免「賣超」實得數量
+FEE_BUFFER_PCT = float(_get("SELL_FEE_BUFFER_PCT", "0.1"))
 
 _client: Client | None = None
 _filters_cache: dict = {}
@@ -132,25 +134,37 @@ async def _on_signal(signal: dict) -> None:
     tid = trades.add(symbol=symbol, entry=float(price), qty=float(qty),
                      buy_order_id=buy_id, signal=signal)
     print(f"[trader] {symbol} 限價買單已掛 @ {price}（qty={qty}，trade#{tid}），等待成交…")
-    asyncio.create_task(_watch_and_protect(tid))
+    asyncio.create_task(_watch_and_protect(tid, order.get("status", "")))
 
 
-async def _watch_and_protect(tid: int) -> None:
-    """輪詢買單直到成交，成交後掛 OCO 止盈止損格。"""
+async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
+    """等買單成交（已成交就跳過輪詢），成交後掛 OCO 止盈止損格。"""
     try:
         trade = trades.get(tid)
         symbol = trade["symbol"]
+        order_id = trade["buy_order_id"]
 
-        while True:
-            order = await _api(_client.get_order, symbol=symbol, orderId=trade["buy_order_id"])
-            status = order["status"]
-            if status == "FILLED":
-                break
-            if status in ("CANCELED", "REJECTED", "EXPIRED"):
-                trades.set_status(tid, "CANCELED")
-                print(f"[trader] {symbol} 買單未成交（{status}），trade#{tid} 取消")
-                return
-            await asyncio.sleep(POLL_INTERVAL)
+        if initial_status != "FILLED":
+            # 剛下單時 testnet 可能因複寫延遲回 -2013（其實單子在），容忍重試
+            not_found = 0
+            await asyncio.sleep(1.0)
+            while True:
+                try:
+                    order = await _api(_client.get_order, symbol=symbol, orderId=order_id)
+                except BinanceAPIException as e:
+                    if e.code == -2013 and not_found < 10:
+                        not_found += 1
+                        await asyncio.sleep(POLL_INTERVAL)
+                        continue
+                    raise
+                status = order["status"]
+                if status == "FILLED":
+                    break
+                if status in ("CANCELED", "REJECTED", "EXPIRED"):
+                    trades.set_status(tid, "CANCELED")
+                    print(f"[trader] {symbol} 買單未成交（{status}），trade#{tid} 取消")
+                    return
+                await asyncio.sleep(POLL_INTERVAL)
 
         await _place_oco_grid(trade)
         trades.set_status(tid, "ACTIVE")
@@ -171,9 +185,10 @@ async def _place_oco_grid(trade: dict) -> None:
     # 止損腿是 stop-limit，限價設得比觸發價低一點，確保急殺時掛得掉
     sl_limit = _quantize(sl1 * (1 - SL_LIMIT_BUFFER_PCT / 100), filt["tick"])
 
-    # 用實際可賣餘額拆分，避免手續費造成「賣超餘額」
-    balance = await _api(_client.get_asset_balance, asset=filt["base"])
-    sellable = _quantize(float(balance["free"]), filt["step"])
+    # 只用「這筆買單成交的數量」拆分（不是帳戶總餘額，避免賣到既有持倉），
+    # 並扣掉手續費緩衝避免賣超實得數量
+    bought = Decimal(str(trade["qty"])) * Decimal(str(1 - FEE_BUFFER_PCT / 100))
+    sellable = _quantize(float(bought), filt["step"])
 
     n = min(len(TP_RATIOS), len(targets))
     ratios = TP_RATIOS[:n]
