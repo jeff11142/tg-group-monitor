@@ -113,15 +113,19 @@ async def main() -> None:
     result, trade = await wait_done(symbol)
     if result == "ACTIVE":
         print(f"\n✅ 鏈路驗證成功！trade#{trade['id']} {symbol} 已成交並掛好 OCO。")
-        print("到幣安 testnet 的『現貨訂單 → 當前委託』可看到 4 張 OCO 止盈止損單。")
+        print("用 python show_orders.py 可看到 4 張 OCO 止盈止損單。")
+        return True
     elif result == "CANCELED":
         print(f"\n⚠️ 買單未成交被取消（trade#{trade['id']}）。可加大 --usdt 或檢查交易對。")
     else:
         print("\n⏱️ 逾時：買單可能尚未成交。檢查上方是否有 [trader] 略過訊息（金額太小/交易對不支援）。")
+    return False
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        ok = asyncio.run(main())
+        raise SystemExit(0 if ok else 1)
     except KeyboardInterrupt:
         print("\n已中止。")
+        raise SystemExit(130)
