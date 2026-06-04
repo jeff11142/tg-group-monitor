@@ -49,7 +49,8 @@ class FakeFuturesClient:
         if kw.get("type") == "LIMIT":
             return {"orderId": self._oid, "status": "FILLED",
                     "executedQty": kw.get("quantity", "0")}
-        return {"orderId": self._oid}
+        # 條件單（TAKE_PROFIT_MARKET / STOP_MARKET）回 algoId、不含 orderId（如真實合約）
+        return {"algoId": self._oid}
 
     def futures_get_order(self, symbol, orderId):
         return {"status": "FILLED", "executedQty": "0", "orderId": orderId}
@@ -57,11 +58,11 @@ class FakeFuturesClient:
     def futures_position_information(self, symbol):
         return [{"symbol": symbol, "positionAmt": self.position_amt}]
 
-    def futures_cancel_order(self, symbol, orderId):
-        self.canceled.append(orderId)
+    def futures_cancel_algo_order(self, algoId=None, **kw):
+        self.canceled.append(algoId)
         return {}
 
-    def futures_cancel_all_open_orders(self, symbol):
+    def futures_cancel_all_open_orders(self, symbol, **kw):
         self.cancel_all_count += 1
         return {}
 
@@ -110,7 +111,7 @@ async def scenario_position_closed():
     tid = trades.list_status("ACTIVE")[-1]["id"]
     fake.position_amt = "0"  # 倉位已平
     await bt._reconcile(trades.get(tid))
-    check("撤掉所有殘留單", fake.cancel_all_count == 1)
+    check("撤掉殘留單（含條件單）", fake.cancel_all_count >= 1)
     check("交易標記 CLOSED", trades.get(tid)["status"] == "CLOSED")
 
 

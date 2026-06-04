@@ -89,6 +89,11 @@ def _qstr(value: float, step: str) -> str:
     return format(_quantize(value, step), "f")
 
 
+def _oid(resp: dict):
+    """合約條件單（TP/SL）回 algoId、一般單回 orderId，取存在的那個。"""
+    return resp.get("orderId") or resp.get("algoId")
+
+
 async def _get_filters(symbol: str) -> dict | None:
     if symbol in _filters_cache:
         return _filters_cache[symbol]
@@ -247,7 +252,9 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
     except BinanceAPIException as e:
         print(f"[trader] trade#{tid} 掛保護單失敗：{e.status_code} {e.message}")
     except Exception as e:
-        print(f"[trader] trade#{tid} 監控失敗：{e}")
+        import traceback
+        print(f"[trader] trade#{tid} 監控失敗：{e!r}")
+        traceback.print_exc()
 
 
 async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dict) -> bool:
@@ -321,7 +328,7 @@ async def _place_protection_futures(trade: dict) -> None:
             type="TAKE_PROFIT_MARKET", stopPrice=format(tp_price, "f"),
             quantity=format(qty_i, "f"), reduceOnly="true",
         )
-        tp_orders.append({"order_id": resp["orderId"], "qty": float(qty_i),
+        tp_orders.append({"order_id": _oid(resp), "qty": float(qty_i),
                           "tp": float(tp_price), "level": i + 1})
         print(f"[trader]   TP{i + 1}: {close_side} {qty_i} @ {tp_price}（reduceOnly）")
 
@@ -331,7 +338,7 @@ async def _place_protection_futures(trade: dict) -> None:
         type="STOP_MARKET", stopPrice=format(sl1, "f"), closePosition="true",
     )
     print(f"[trader]   SL: {close_side} 全平 @ {sl1}（closePosition）")
-    trades.set_oco(trade["id"], {"mode": "futures", "sl_order_id": sl_resp["orderId"],
+    trades.set_oco(trade["id"], {"mode": "futures", "sl_order_id": _oid(sl_resp),
                                  "sl_price": float(sl1), "tp_orders": tp_orders})
 
 
@@ -435,7 +442,7 @@ async def _reconcile_futures(trade: dict) -> None:
 
     # #1 自動收單：倉位歸零 = 已全平 → 撤掉殘留止盈止損單、標記 CLOSED
     if amt == 0:
-        await _api(_client.futures_cancel_all_open_orders, symbol=symbol)
+        await _cancel_all_futures_orders(symbol)
         trades.set_status(trade["id"], "CLOSED")
         print(f"[trader] trade#{trade['id']} {symbol} 倉位已平 → CLOSED（釋放持倉額度）")
         return
@@ -462,16 +469,26 @@ async def _move_sl_breakeven_futures(trade: dict, info: dict) -> None:
     old_sl = info.get("sl_order_id")
     if old_sl:
         try:
-            await _api(_client.futures_cancel_order, symbol=symbol, orderId=old_sl)
+            await _api(_client.futures_cancel_algo_order, algoId=old_sl)
         except BinanceAPIException as e:
-            if e.code != -2011:
+            if e.code != -2011:  # -2011 = 訂單已不存在
                 raise
     resp = await _api(_client.futures_create_order, symbol=symbol, side=close_side,
                       type="STOP_MARKET", stopPrice=format(be, "f"), closePosition="true")
-    info["sl_order_id"] = resp["orderId"]
+    info["sl_order_id"] = _oid(resp)
     info["sl_price"] = float(be)
     trades.update_oco(trade["id"], info, sl_moved=True)
     print(f"[trader] trade#{trade['id']} {symbol} 止盈已觸發，止損移到保本 {be}")
+
+
+async def _cancel_all_futures_orders(symbol: str) -> None:
+    """撤掉某交易對的一般單與條件單（TP/SL），忽略「無單可撤」。"""
+    for kwargs in ({"conditional": True}, {}):
+        try:
+            await _api(_client.futures_cancel_all_open_orders, symbol=symbol, **kwargs)
+        except BinanceAPIException as e:
+            if e.code != -2011:
+                print(f"[trader] 撤單警告 {symbol} {kwargs}：{e.message}")
 
 
 async def _reconcile_spot(trade: dict) -> None:

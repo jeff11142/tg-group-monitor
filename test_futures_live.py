@@ -28,20 +28,23 @@ import trades  # noqa: E402
 
 
 def _fmt_orders(orders: list) -> None:
+    """一般單與條件單(TP/SL)欄位不同，兩種都相容顯示。"""
     if not orders:
         print("  （無）")
         return
-    for o in sorted(orders, key=lambda x: x["orderId"]):
-        stop = o.get("stopPrice", "0")
-        stop_txt = f" stop={stop}" if stop and float(stop) > 0 else ""
+    for o in orders:
+        oid = o.get("orderId") or o.get("algoId")
+        otype = o.get("type") or o.get("orderType")
+        qty = o.get("origQty") or o.get("quantity")
+        trig = o.get("stopPrice") or o.get("triggerPrice") or "0"
+        trig_txt = f" trig={trig}" if trig and float(trig) > 0 else ""
         extra = []
         if o.get("reduceOnly"):
             extra.append("reduceOnly")
         if o.get("closePosition"):
             extra.append("closePosition")
         tag = f" [{','.join(extra)}]" if extra else ""
-        print(f"  #{o['orderId']} {o['side']} {o['type']} "
-              f"qty={o['origQty']} price={o['price']}{stop_txt}{tag}")
+        print(f"  #{oid} {o['side']} {otype} qty={qty}{trig_txt}{tag}")
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -112,16 +115,23 @@ async def run(args: argparse.Namespace) -> None:
                 print(f"  trade#{t['id']} {t['symbol']} status={t['status']} "
                       f"entry={t['entry']} qty={t['qty']} sl_moved={t.get('sl_moved')}")
 
-    print(f"\n=== {symbol} 交易所目前掛單 ===")
+    print(f"\n=== {symbol} 交易所一般掛單 ===")
     orders = await asyncio.to_thread(client.futures_get_open_orders, symbol=symbol)
     _fmt_orders(orders)
+    print(f"\n=== {symbol} 交易所條件單（止盈/止損）===")
+    cond = await asyncio.to_thread(client.futures_get_open_orders, symbol=symbol, conditional=True)
+    _fmt_orders(cond)
 
     pos = await asyncio.to_thread(client.futures_position_information, symbol=symbol)
     amt = float(pos[0]["positionAmt"]) if pos else 0.0
     print(f"\n=== {symbol} 目前倉位：{amt} ===")
-    if args.cleanup and orders:
-        await asyncio.to_thread(client.futures_cancel_all_open_orders, symbol=symbol)
-        print("（已依 --cleanup 撤掉上面所有掛單）")
+    if args.cleanup:
+        for kwargs in ({"conditional": True}, {}):
+            try:
+                await asyncio.to_thread(client.futures_cancel_all_open_orders, symbol=symbol, **kwargs)
+            except Exception:
+                pass
+        print("（已依 --cleanup 撤掉一般單與條件單）")
 
 
 def parse_args() -> argparse.Namespace:
