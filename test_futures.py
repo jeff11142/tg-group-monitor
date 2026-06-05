@@ -35,7 +35,7 @@ class FakeFuturesClient:
         self.order_status = "FILLED"
         self.executed_qty = "0"
         self.open_conditional = []  # 還掛著的條件單（TP/SL）
-        self.reject_stop = False    # True=掛 STOP_MARKET 時丟 -2021（模擬已穿過止損）
+        self.stop_error = None      # 設成 error code → 掛 STOP_MARKET 時丟該錯
         self._oid = 7000
 
     def futures_exchange_info(self):
@@ -56,8 +56,8 @@ class FakeFuturesClient:
         return {}
 
     def futures_create_order(self, **kw):
-        if self.reject_stop and kw.get("type") == "STOP_MARKET":
-            raise _api_error(-2021)
+        if self.stop_error and kw.get("type") == "STOP_MARKET":
+            raise _api_error(self.stop_error)
         self._oid += 1
         self.created.append({**kw, "orderId": self._oid})
         if kw.get("type") == "LIMIT":
@@ -240,7 +240,7 @@ async def scenario_sl_immediate_trigger():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
     fake = bt._client = FakeFuturesClient(price="94")
-    fake.reject_stop = True      # 掛止損會被拒（價格已破止損）
+    fake.stop_error = -2021      # 掛止損被拒（價格已破止損）
     fake.position_amt = "0.3"    # 進場已成交
     bt._filters_cache.clear()
     await bt.on_signal(SIGNAL)   # SL=95，現價 94 已破
@@ -268,6 +268,23 @@ async def scenario_no_position_on_protect():
     check("交易標記 CLOSED", trades.get(tid)["status"] == "CLOSED")
 
 
+async def scenario_sl_place_fail_failsafe():
+    print("\n[合約-10] 止損單掛不上(非-2021) → 不中斷、存sl_price交保險絲、仍 ACTIVE")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="100")  # 未破 SL(95)
+    fake.stop_error = -4136  # STOP_MARKET 掛單失敗（模擬 closePosition 失靈）
+    bt._filters_cache.clear()
+    await bt.on_signal(SIGNAL)  # SL=95
+    await asyncio.sleep(0.2)
+    active = trades.list_status("ACTIVE")
+    check("交易仍進 ACTIVE（沒卡 PENDING_BUY）", len(active) == 1)
+    info = active[0]["oco_orders"]
+    check("有存 sl_price 供保險絲", info.get("sl_price") == 95.0)
+    check("sl_order_id 為 None（交易所 SL 沒掛上）", info.get("sl_order_id") is None)
+    check("4 段 TP 仍正常掛上", len(info.get("tp_orders")) == 4)
+
+
 async def main():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
@@ -287,6 +304,7 @@ async def main():
     await scenario_tp_failsafe()
     await scenario_sl_immediate_trigger()
     await scenario_no_position_on_protect()
+    await scenario_sl_place_fail_failsafe()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 

@@ -392,7 +392,8 @@ async def _place_protection_futures(trade: dict) -> bool:
         trades.set_status(trade["id"], "CLOSED")
         return False
 
-    # 先掛止損；若進場時價格已穿過止損 → 幣安拒 -2021 → 當下直接市價全平
+    # 先掛止損。-2021=已穿過止損→直接全平；其他錯誤→不中斷，靠對帳保險絲兜底
+    sl_order_id = None
     try:
         sl_resp = await _api(
             _client.futures_create_order, symbol=symbol, side=close_side,
@@ -401,11 +402,12 @@ async def _place_protection_futures(trade: dict) -> bool:
         sl_order_id = _oid(sl_resp)
         print(f"[trader]   SL: {close_side} 全平 @ {sl1}（closePosition）")
     except BinanceAPIException as e:
-        if e.code != -2021:  # -2021 = Order would immediately trigger（已穿過止損）
-            raise
-        print(f"[trader] ⚠️ {symbol} 進場時價格已穿過止損 {sl1} → 直接市價全平")
-        await _force_close_now(trade, close_side, filt)
-        return False
+        if e.code == -2021:  # Order would immediately trigger（已穿過止損）
+            print(f"[trader] ⚠️ {symbol} 進場時價格已穿過止損 {sl1} → 直接市價全平")
+            await _force_close_now(trade, close_side, filt)
+            return False
+        # 其他原因掛不上（如交易所暫時拒 closePosition）→ 不中斷，sl_price 仍會存，由保險絲兜底
+        print(f"[trader] ⚠️ {symbol} 止損單掛單失敗（{e.message}）→ 改由對帳保險絲兜底（SL_FAILSAFE）")
 
     # 再掛 N 段止盈；某段若進場時已達 → 市價賣掉那段（直接落袋）
     n = min(len(TP_RATIOS), len(targets))
