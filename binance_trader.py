@@ -50,6 +50,8 @@ FUTURES = _get("BINANCE_FUTURES", "0") == "1"
 LEVERAGE = int(_get("LEVERAGE", "1"))
 MARGIN_TYPE = _get("MARGIN_TYPE", "ISOLATED").upper()
 TRADE_SIDE = _get("TRADE_SIDE", "LONG").upper()  # 預留做空；目前只用 LONG
+# 止損保險絲：對帳時若價格已穿過止損價但倉位還在（交易所條件單失靈）就主動市價平倉
+SL_FAILSAFE = _get("SL_FAILSAFE", "1") == "1"
 
 
 def _sides() -> tuple[str, str]:
@@ -504,10 +506,47 @@ async def _reconcile_futures(trade: dict) -> None:
         print(f"[trader] trade#{trade['id']} {symbol} 倉位已平 → CLOSED（釋放持倉額度）")
         return
 
+    # 保險絲：價格已穿過止損價但倉位還在（交易所條件單失靈）→ 主動市價平倉兜底
+    sl_price = info.get("sl_price")
+    if SL_FAILSAFE and sl_price:
+        ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
+        price = float(ticker.get("price") or 0)
+        if price > 0 and _stop_breached(price, float(sl_price)):
+            await _force_close_futures(trade, amt, price, float(sl_price))
+            return
+
     # #2 移動止損到保本：倉位比原始量少 = 有止盈成交（止損會一次全平，不會只少一部分）
     if (BREAKEVEN_AFTER_TP1 and not trade.get("sl_moved")
             and amt < float(trade["qty"]) * 0.999):
         await _move_sl_breakeven_futures(trade, info)
+
+
+def _stop_breached(price: float, sl_price: float) -> bool:
+    """價格是否已穿過止損：做多 = 跌破；做空 = 漲破。"""
+    if TRADE_SIDE == "SHORT":
+        return price >= sl_price
+    return price <= sl_price
+
+
+async def _force_close_futures(trade: dict, amt: float, price: float, sl_price: float) -> None:
+    """保險絲：條件單沒觸發時，主動市價平掉整個倉位、撤殘留單、標記 CLOSED。"""
+    symbol = trade["symbol"]
+    _, close_side = _sides()
+    filt = await _get_filters(symbol)
+    qty = _quantize(amt, filt["step"])
+    print(f"[trader] ⚠️ trade#{trade['id']} {symbol} 現價 {price} 已穿過止損 {sl_price}，"
+          f"倉位未平 → 保險絲主動市價平倉 {qty}")
+    try:
+        await _api(_client.futures_create_order, symbol=symbol, side=close_side,
+                   type="MARKET", quantity=format(qty, "f"), reduceOnly="true")
+    except BinanceAPIException as e:
+        # -2022 ReduceOnly 被拒：通常是條件單剛好同時觸發、倉位已平，下輪對帳會收單
+        if e.code != -2022:
+            print(f"[trader] 保險絲平倉失敗：{e.status_code} {e.message}")
+        return
+    await _cancel_all_futures_orders(symbol)
+    trades.set_status(trade["id"], "CLOSED")
+    print(f"[trader] trade#{trade['id']} {symbol} 保險絲已平倉 → CLOSED")
 
 
 async def _move_sl_breakeven_futures(trade: dict, info: dict) -> None:

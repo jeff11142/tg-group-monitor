@@ -153,6 +153,43 @@ async def scenario_timeout_but_filled():
     check("沒有去撤單（因已成交）", len(fake.canceled) == 0)
 
 
+async def scenario_sl_failsafe():
+    print("\n[合約-5] 價格穿過止損但倉位還在 → 保險絲主動市價平倉")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="94")  # 現價 94 < SL 95
+    bt._filters_cache.clear()
+    bt.SL_FAILSAFE = True
+    await bt.on_signal(SIGNAL)  # SL=95
+    await asyncio.sleep(0.2)
+    tid = trades.list_status("ACTIVE")[-1]["id"]
+    fake.position_amt = "0.3"   # 倉位還在（條件單沒觸發）
+    fake.created.clear()
+    await bt._reconcile(trades.get(tid))
+    closes = [c for c in fake.created if c.get("type") == "MARKET" and c.get("reduceOnly") == "true"]
+    check("有送出市價平倉單", len(closes) == 1)
+    check("方向是 SELL（平多）", closes[0]["side"] == "SELL")
+    check("撤掉殘留條件單", fake.cancel_all_count >= 1)
+    check("交易標記 CLOSED", trades.get(tid)["status"] == "CLOSED")
+
+
+async def scenario_sl_failsafe_not_breached():
+    print("\n[合約-6] 價格還在止損上方 → 保險絲不動作")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="105")  # 現價 105 > SL 95
+    bt._filters_cache.clear()
+    bt.SL_FAILSAFE = True
+    await bt.on_signal(SIGNAL)
+    await asyncio.sleep(0.2)
+    tid = trades.list_status("ACTIVE")[-1]["id"]
+    fake.position_amt = "0.3"
+    fake.created.clear()
+    await bt._reconcile(trades.get(tid))
+    check("沒有市價平倉", not any(c.get("type") == "MARKET" for c in fake.created))
+    check("交易維持 ACTIVE", trades.get(tid)["status"] == "ACTIVE")
+
+
 async def main():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
@@ -167,6 +204,8 @@ async def main():
     await scenario_position_closed()
     await scenario_breakeven()
     await scenario_timeout_but_filled()
+    await scenario_sl_failsafe()
+    await scenario_sl_failsafe_not_breached()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 
