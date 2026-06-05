@@ -32,6 +32,8 @@ API_SECRET = _get("BINANCE_API_SECRET")
 TRADE_USDT = float(_get("TRADE_USDT", "50"))
 # 自動最小金額：1=每筆依交易對自動算出「能成功下單＋拆得出分批」的最小金額並用它下單
 AUTO_MIN_AMOUNT = _get("AUTO_MIN_AMOUNT", "0") == "1"
+# 自動最小金額模式：先把幣安最小可下量乘上這個倍數當「投入保證金本金」，再乘槓桿成下單名目。
+MIN_AMOUNT_MULT = float(_get("MIN_AMOUNT_MULT", "10"))
 MAX_OPEN_TRADES = int(_get("MAX_OPEN_TRADES", "5"))
 TP_RATIOS = [float(x) for x in _get("TP_RATIOS", "30,30,20,20").split(",") if x.strip()]
 SL_LIMIT_BUFFER_PCT = float(_get("SL_LIMIT_BUFFER_PCT", "0.3"))
@@ -193,8 +195,13 @@ async def _on_signal(signal: dict) -> None:
         price = _quantize(entry, filt["tick"])
         n = min(len(TP_RATIOS), len(targets))
         if AUTO_MIN_AMOUNT:
-            amount = _min_amount(filt, float(price), n)
-            print(f"[trader] {symbol} 自動最小金額：{amount:.2f} USDT"
+            # 名目 = 幣安最小可下量 × 倍數 × 槓桿。最小量×倍數＝實際投入的保證金本金，
+            # 再乘槓桿才是下單名目。例：min=5.25、×10＝保證金 52.5、×10x → 名目 525 USDT。
+            base = _min_amount(filt, float(price), n)
+            margin = base * MIN_AMOUNT_MULT
+            amount = margin * LEVERAGE
+            print(f"[trader] {symbol} 自動最小金額：{base:.2f} × {MIN_AMOUNT_MULT:g}"
+                  f" = 保證金 {margin:.2f} USDT × {LEVERAGE}x → 名目 {amount:.2f} USDT"
                   f"（minNotional={filt['min_notional']}, minQty={filt['min_qty']}）")
         else:
             amount = TRADE_USDT

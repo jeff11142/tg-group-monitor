@@ -115,8 +115,15 @@ def dry_run(signal: dict) -> None:
         return
     entry = bt._quantize(signal["entry"], filt["tick"])
     n = min(len(bt.TP_RATIOS), len(signal["targets"]))
-    amount = bt._min_amount(filt, float(entry), n) if bt.AUTO_MIN_AMOUNT else bt.TRADE_USDT
-    amt_src = "自動最小金額" if bt.AUTO_MIN_AMOUNT else "固定 TRADE_USDT"
+    if bt.AUTO_MIN_AMOUNT:
+        base = bt._min_amount(filt, float(entry), n)
+        margin = base * bt.MIN_AMOUNT_MULT
+        amount = margin * bt.LEVERAGE
+        amt_src = (f"自動最小金額（{base:.2f} × {bt.MIN_AMOUNT_MULT:g}"
+                   f" = 保證金 {margin:.2f} × {bt.LEVERAGE}x）")
+    else:
+        amount = bt.TRADE_USDT
+        amt_src = "固定 TRADE_USDT"
     qty = bt._quantize(amount / float(entry), filt["step"])
     portions = bt._split_portions(qty, n, filt["step"])
     sl1 = bt._quantize(signal["stops"][0]["price"], filt["tick"])
