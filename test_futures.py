@@ -24,6 +24,8 @@ class FakeFuturesClient:
         self.leverage = None
         self.margin = None
         self.position_amt = "0"
+        self.order_status = "FILLED"
+        self.executed_qty = "0"
         self._oid = 7000
 
     def futures_exchange_info(self):
@@ -53,7 +55,7 @@ class FakeFuturesClient:
         return {"algoId": self._oid}
 
     def futures_get_order(self, symbol, orderId):
-        return {"status": "FILLED", "executedQty": "0", "orderId": orderId}
+        return {"status": self.order_status, "executedQty": self.executed_qty, "orderId": orderId}
 
     def futures_position_information(self, symbol):
         return [{"symbol": symbol, "positionAmt": self.position_amt}]
@@ -136,6 +138,21 @@ async def scenario_breakeven():
     check("多掛了一張止損", len(after_sl) == len(before_sl) + 1)
 
 
+async def scenario_timeout_but_filled():
+    print("\n[合約-4] 超時瞬間其實已成交 → 不誤判取消，照掛保護單")
+    fake = bt._client = FakeFuturesClient()
+    fake.order_status = "FILLED"  # 超時時重查顯示已成交
+    bt._filters_cache.clear()
+    tid = trades.add("BTCUSDT", 100, 0.3, 888, SIGNAL)
+    trades.set_status(tid, "PENDING_BUY")
+    # 傳入「上一次輪詢的舊狀態」NEW，模擬剛好在超時瞬間成交
+    result = await bt._handle_entry_timeout(tid, "BTCUSDT", 888,
+                                            {"status": "NEW", "executedQty": "0"})
+    check("回傳需掛保護單(True)", result is True)
+    check("交易未被誤標 CANCELED", trades.get(tid)["status"] != "CANCELED")
+    check("沒有去撤單（因已成交）", len(fake.canceled) == 0)
+
+
 async def main():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
@@ -149,6 +166,7 @@ async def main():
     await scenario_entry_and_protection()
     await scenario_position_closed()
     await scenario_breakeven()
+    await scenario_timeout_but_filled()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 

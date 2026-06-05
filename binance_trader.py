@@ -296,14 +296,34 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
 
 
 async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dict) -> bool:
-    """限價買單超時：撤單釋放額度。回傳是否「有可觀的部分成交、需改掛 OCO 保護」。"""
+    """限價買單超時：撤單釋放額度。回傳是否「已成交（全部或可觀部分）、需掛保護單」。"""
+    # 撤單前先重查最新狀態，避免「剛好在超時瞬間成交」卻用舊資料誤判成未成交
+    try:
+        order = await _get_order(symbol, order_id)
+    except BinanceAPIException:
+        pass  # 查不到就沿用傳入的舊 order
+
+    if order.get("status") == "FILLED":
+        print(f"[trader] {symbol} 超時前其實已全部成交，照常掛保護單（trade#{tid}）")
+        return True  # trade qty 即原始下單量，直接掛完整保護
+
+    # 仍未完全成交 → 撤掉剩餘
     try:
         await _cancel_order(symbol, order_id)
     except BinanceAPIException as e:
         if e.code != -2011:  # -2011 = 訂單已不存在（剛好成交/已撤），忽略
             raise
 
+    # 撤單後再查一次最終成交量（撤單瞬間可能又成交一部分）
+    try:
+        order = await _get_order(symbol, order_id)
+    except BinanceAPIException:
+        pass
+
     filt = await _get_filters(symbol)
+    if order.get("status") == "FILLED":  # 撤單那瞬間剛好全部成交
+        print(f"[trader] {symbol} 撤單前剛好全部成交，照常掛保護單（trade#{tid}）")
+        return True
     executed = _quantize(float(order.get("executedQty", 0) or 0), filt["step"])
     price = Decimal(str(trades.get(tid)["entry"]))
 
@@ -314,8 +334,7 @@ async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dic
         return True
 
     trades.set_status(tid, "CANCELED")
-    mins = ENTRY_TIMEOUT_MIN
-    print(f"[trader] {symbol} 買單超過 {mins:g} 分鐘未成交，已撤單，trade#{tid} 取消（釋放額度）")
+    print(f"[trader] {symbol} 買單超過 {ENTRY_TIMEOUT_MIN:g} 分鐘未成交，已撤單，trade#{tid} 取消（釋放額度）")
     return False
 
 
