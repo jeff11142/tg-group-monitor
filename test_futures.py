@@ -26,6 +26,7 @@ class FakeFuturesClient:
         self.position_amt = "0"
         self.order_status = "FILLED"
         self.executed_qty = "0"
+        self.open_conditional = []  # 還掛著的條件單（TP/SL）
         self._oid = 7000
 
     def futures_exchange_info(self):
@@ -52,6 +53,8 @@ class FakeFuturesClient:
             return {"orderId": self._oid, "status": "FILLED",
                     "executedQty": kw.get("quantity", "0")}
         # 條件單（TAKE_PROFIT_MARKET / STOP_MARKET）回 algoId、不含 orderId（如真實合約）
+        if kw.get("type") in ("TAKE_PROFIT_MARKET", "STOP_MARKET"):
+            self.open_conditional.append({"algoId": self._oid, **kw})
         return {"algoId": self._oid}
 
     def futures_get_order(self, symbol, orderId):
@@ -60,12 +63,17 @@ class FakeFuturesClient:
     def futures_position_information(self, symbol):
         return [{"symbol": symbol, "positionAmt": self.position_amt}]
 
+    def futures_get_open_orders(self, symbol, conditional=False):
+        return list(self.open_conditional) if conditional else []
+
     def futures_cancel_algo_order(self, algoId=None, **kw):
         self.canceled.append(algoId)
+        self.open_conditional = [o for o in self.open_conditional if o["algoId"] != algoId]
         return {}
 
     def futures_cancel_all_open_orders(self, symbol, **kw):
         self.cancel_all_count += 1
+        self.open_conditional = []
         return {}
 
     def futures_symbol_ticker(self, symbol):
@@ -121,6 +129,7 @@ async def scenario_breakeven():
     print("\n[合約-3] 倉位減少（止盈成交）→ 止損移到保本")
     fake = bt._client = FakeFuturesClient(price="103")  # 現價高於進場
     bt._filters_cache.clear()
+    bt.TP_FAILSAFE = False  # 隔離測試移保本，不讓 TP 保險絲搶先觸發
     await bt.on_signal(SIGNAL)
     await asyncio.sleep(0.2)
     tid = trades.list_status("ACTIVE")[-1]["id"]
@@ -160,6 +169,7 @@ async def scenario_sl_failsafe():
     fake = bt._client = FakeFuturesClient(price="94")  # 現價 94 < SL 95
     bt._filters_cache.clear()
     bt.SL_FAILSAFE = True
+    bt.TP_FAILSAFE = True
     await bt.on_signal(SIGNAL)  # SL=95
     await asyncio.sleep(0.2)
     tid = trades.list_status("ACTIVE")[-1]["id"]
@@ -174,12 +184,13 @@ async def scenario_sl_failsafe():
 
 
 async def scenario_sl_failsafe_not_breached():
-    print("\n[合約-6] 價格還在止損上方 → 保險絲不動作")
+    print("\n[合約-6] 價格在止損上方、也未達任何止盈 → 保險絲不動作")
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
-    fake = bt._client = FakeFuturesClient(price="105")  # 現價 105 > SL 95
+    fake = bt._client = FakeFuturesClient(price="100.5")  # 高於 SL 95、低於 TP1 101
     bt._filters_cache.clear()
     bt.SL_FAILSAFE = True
+    bt.TP_FAILSAFE = True
     await bt.on_signal(SIGNAL)
     await asyncio.sleep(0.2)
     tid = trades.list_status("ACTIVE")[-1]["id"]
@@ -188,6 +199,28 @@ async def scenario_sl_failsafe_not_breached():
     await bt._reconcile(trades.get(tid))
     check("沒有市價平倉", not any(c.get("type") == "MARKET" for c in fake.created))
     check("交易維持 ACTIVE", trades.get(tid)["status"] == "ACTIVE")
+
+
+async def scenario_tp_failsafe():
+    print("\n[合約-7] 價格達 TP1/TP2 但沒成交 → 止盈逐段市價補平")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="102.5")  # 過 TP1(101)/TP2(102)，未到 TP3(103)
+    bt._filters_cache.clear()
+    bt.TP_FAILSAFE = True
+    bt.SL_FAILSAFE = True
+    await bt.on_signal(SIGNAL)  # TP 101/102/103/104，SL 95
+    await asyncio.sleep(0.2)
+    tid = trades.list_status("ACTIVE")[-1]["id"]
+    fake.position_amt = "0.3"
+    fake.created.clear()
+    await bt._reconcile(trades.get(tid))
+    closes = [c for c in fake.created if c.get("type") == "MARKET"]
+    check("只補平 2 段（TP1, TP2）", len(closes) == 2)
+    check("都是 SELL reduceOnly 部分平倉", all(
+        c["side"] == "SELL" and c["reduceOnly"] == "true" for c in closes))
+    check("撤掉那 2 張 TP 條件單", len(fake.canceled) == 2)
+    check("沒有全平（倉位未歸零、未 CLOSED）", trades.get(tid)["status"] == "ACTIVE")
 
 
 async def main():
@@ -206,6 +239,7 @@ async def main():
     await scenario_timeout_but_filled()
     await scenario_sl_failsafe()
     await scenario_sl_failsafe_not_breached()
+    await scenario_tp_failsafe()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 

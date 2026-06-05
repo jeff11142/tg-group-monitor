@@ -52,6 +52,8 @@ MARGIN_TYPE = _get("MARGIN_TYPE", "ISOLATED").upper()
 TRADE_SIDE = _get("TRADE_SIDE", "LONG").upper()  # 預留做空；目前只用 LONG
 # 止損保險絲：對帳時若價格已穿過止損價但倉位還在（交易所條件單失靈）就主動市價平倉
 SL_FAILSAFE = _get("SL_FAILSAFE", "1") == "1"
+# 止盈保險絲：對帳時若價格已穿過某段止盈但該段還掛著沒成交，就逐段市價補平那一段
+TP_FAILSAFE = _get("TP_FAILSAFE", "1") == "1"
 
 
 def _sides() -> tuple[str, str]:
@@ -506,19 +508,68 @@ async def _reconcile_futures(trade: dict) -> None:
         print(f"[trader] trade#{trade['id']} {symbol} 倉位已平 → CLOSED（釋放持倉額度）")
         return
 
-    # 保險絲：價格已穿過止損價但倉位還在（交易所條件單失靈）→ 主動市價平倉兜底
+    # 取一次現價供保險絲判斷
     sl_price = info.get("sl_price")
-    if SL_FAILSAFE and sl_price:
+    need_price = (SL_FAILSAFE and sl_price) or (TP_FAILSAFE and info.get("tp_orders"))
+    price = 0.0
+    if need_price:
         ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
         price = float(ticker.get("price") or 0)
-        if price > 0 and _stop_breached(price, float(sl_price)):
-            await _force_close_futures(trade, amt, price, float(sl_price))
-            return
+
+    # 止損保險絲：價格穿過止損價但倉位還在 → 主動市價「全平」兜底
+    if SL_FAILSAFE and sl_price and price > 0 and _stop_breached(price, float(sl_price)):
+        await _force_close_futures(trade, amt, price, float(sl_price))
+        return
+
+    # 止盈保險絲：價格穿過某段止盈但該段條件單還掛著沒成交 → 市價「逐段補平」
+    if TP_FAILSAFE and price > 0 and info.get("tp_orders"):
+        if await _tp_failsafe_futures(trade, info, price):
+            return  # 有補平就這輪先收尾，下輪再判斷移保本/收單
 
     # #2 移動止損到保本：倉位比原始量少 = 有止盈成交（止損會一次全平，不會只少一部分）
     if (BREAKEVEN_AFTER_TP1 and not trade.get("sl_moved")
             and amt < float(trade["qty"]) * 0.999):
         await _move_sl_breakeven_futures(trade, info)
+
+
+def _tp_breached(price: float, tp_price: float) -> bool:
+    """價格是否已達止盈：做多 = 漲到；做空 = 跌到。"""
+    if TRADE_SIDE == "SHORT":
+        return price <= tp_price
+    return price >= tp_price
+
+
+async def _tp_failsafe_futures(trade: dict, info: dict, price: float) -> bool:
+    """逐段檢查：某段 TP 條件單還掛著、但價格已達該 TP → 市價補平那一段。回傳是否有動作。"""
+    symbol = trade["symbol"]
+    _, close_side = _sides()
+    filt = await _get_filters(symbol)
+    cond = await _api(_client.futures_get_open_orders, symbol=symbol, conditional=True)
+    open_ids = {(o.get("orderId") or o.get("algoId")) for o in cond}
+
+    acted = False
+    for tp in info.get("tp_orders") or []:
+        if tp.get("order_id") not in open_ids:
+            continue  # 該段已成交或已取消
+        if not _tp_breached(price, float(tp["tp"])):
+            continue
+        # 先撤掉該段 TP 條件單（避免等下又自己觸發重複賣），再市價補平該段數量
+        try:
+            await _api(_client.futures_cancel_algo_order, algoId=tp["order_id"])
+        except BinanceAPIException as e:
+            if e.code != -2011:
+                raise
+        qty = _quantize(float(tp["qty"]), filt["step"])
+        try:
+            await _api(_client.futures_create_order, symbol=symbol, side=close_side,
+                       type="MARKET", quantity=format(qty, "f"), reduceOnly="true")
+            print(f"[trader] ⚠️ trade#{trade['id']} {symbol} 現價 {price} 已達 "
+                  f"TP{tp['level']} {tp['tp']} 但未成交 → 保險絲補平 {qty}")
+            acted = True
+        except BinanceAPIException as e:
+            if e.code != -2022:  # -2022 reduceOnly 被拒：倉位已不足，忽略
+                print(f"[trader] TP 保險絲補平失敗：{e.status_code} {e.message}")
+    return acted
 
 
 def _stop_breached(price: float, sl_price: float) -> bool:
