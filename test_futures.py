@@ -13,6 +13,14 @@ import tempfile
 
 import trades
 import binance_trader as bt
+from binance.exceptions import BinanceAPIException
+
+
+def _api_error(code: int):
+    class _R:
+        status_code = 400
+        text = '{"code": %d, "msg": "Order would immediately trigger."}' % code
+    return BinanceAPIException(_R(), 400, _R.text)
 
 
 class FakeFuturesClient:
@@ -27,6 +35,7 @@ class FakeFuturesClient:
         self.order_status = "FILLED"
         self.executed_qty = "0"
         self.open_conditional = []  # 還掛著的條件單（TP/SL）
+        self.reject_stop = False    # True=掛 STOP_MARKET 時丟 -2021（模擬已穿過止損）
         self._oid = 7000
 
     def futures_exchange_info(self):
@@ -47,6 +56,8 @@ class FakeFuturesClient:
         return {}
 
     def futures_create_order(self, **kw):
+        if self.reject_stop and kw.get("type") == "STOP_MARKET":
+            raise _api_error(-2021)
         self._oid += 1
         self.created.append({**kw, "orderId": self._oid})
         if kw.get("type") == "LIMIT":
@@ -223,6 +234,23 @@ async def scenario_tp_failsafe():
     check("沒有全平（倉位未歸零、未 CLOSED）", trades.get(tid)["status"] == "ACTIVE")
 
 
+async def scenario_sl_immediate_trigger():
+    print("\n[合約-8] 進場時價格已穿過止損（掛 SL 被 -2021 拒）→ 直接市價全平、不留裸倉")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="94")
+    fake.reject_stop = True      # 掛止損會被拒（價格已破止損）
+    fake.position_amt = "0.3"    # 進場已成交
+    bt._filters_cache.clear()
+    await bt.on_signal(SIGNAL)   # SL=95，現價 94 已破
+    await asyncio.sleep(0.2)
+    check("沒留下 ACTIVE 裸倉", len(trades.list_status("ACTIVE")) == 0)
+    closed = [t for t in trades.list_status("CLOSED") if t["symbol"] == "BTCUSDT"]
+    check("交易被直接平倉 → CLOSED", len(closed) >= 1)
+    closes = [c for c in fake.created if c.get("type") == "MARKET"]
+    check("有送出市價平倉單", len(closes) >= 1)
+
+
 async def main():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
@@ -240,6 +268,7 @@ async def main():
     await scenario_sl_failsafe()
     await scenario_sl_failsafe_not_breached()
     await scenario_tp_failsafe()
+    await scenario_sl_immediate_trigger()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 

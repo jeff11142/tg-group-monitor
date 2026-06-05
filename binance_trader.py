@@ -290,9 +290,9 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
                     return
                 await asyncio.sleep(POLL_INTERVAL)
 
-        await _place_protection(trade)
-        trades.set_status(tid, "ACTIVE")
-        print(f"[trader] {symbol} 已成交，止盈止損掛好，trade#{tid} → ACTIVE")
+        if await _place_protection(trade):
+            trades.set_status(tid, "ACTIVE")
+            print(f"[trader] {symbol} 已成交，止盈止損掛好，trade#{tid} → ACTIVE")
     except BinanceAPIException as e:
         print(f"[trader] trade#{tid} 掛保護單失敗：{e.status_code} {e.message}")
     except Exception as e:
@@ -358,16 +358,26 @@ def _split_portions(qty_total: Decimal, n: int, step: str) -> list[Decimal]:
     return portions
 
 
-async def _place_protection(trade: dict) -> None:
-    """掛止盈止損：合約走 reduce-only/closePosition，現貨走 OCO 格。"""
+async def _place_protection(trade: dict) -> bool:
+    """掛止盈止損。回傳 True=已掛好(該設 ACTIVE)；False=進場即穿止損已直接平倉(已 CLOSED)。"""
     if FUTURES:
-        await _place_protection_futures(trade)
-    else:
-        await _place_oco_grid(trade)
+        return await _place_protection_futures(trade)
+    await _place_oco_grid(trade)
+    return True
 
 
-async def _place_protection_futures(trade: dict) -> None:
-    """合約：掛 N 張 reduce-only 止盈 + 1 張 closePosition 止損（碰 SL1 全平）。"""
+async def _market_close_qty(symbol: str, close_side: str, qty: Decimal) -> None:
+    """市價 reduceOnly 平掉指定數量（忽略 -2022 倉位不足）。"""
+    try:
+        await _api(_client.futures_create_order, symbol=symbol, side=close_side,
+                   type="MARKET", quantity=format(qty, "f"), reduceOnly="true")
+    except BinanceAPIException as e:
+        if e.code != -2022:  # -2022 reduceOnly 被拒（倉位已不足）
+            raise
+
+
+async def _place_protection_futures(trade: dict) -> bool:
+    """合約：先掛止損，再掛 N 段止盈。進場時已穿過的價位改用市價即時處理。"""
     symbol = trade["symbol"]
     signal = trade["signal"]
     filt = await _get_filters(symbol)
@@ -375,32 +385,60 @@ async def _place_protection_futures(trade: dict) -> None:
     _, close_side = _sides()
     sl1 = _quantize(signal["stops"][0]["price"], filt["tick"])
 
+    # 先掛止損；若進場時價格已穿過止損 → 幣安拒 -2021 → 當下直接市價全平
+    try:
+        sl_resp = await _api(
+            _client.futures_create_order, symbol=symbol, side=close_side,
+            type="STOP_MARKET", stopPrice=format(sl1, "f"), closePosition="true",
+        )
+        sl_order_id = _oid(sl_resp)
+        print(f"[trader]   SL: {close_side} 全平 @ {sl1}（closePosition）")
+    except BinanceAPIException as e:
+        if e.code != -2021:  # -2021 = Order would immediately trigger（已穿過止損）
+            raise
+        print(f"[trader] ⚠️ {symbol} 進場時價格已穿過止損 {sl1} → 直接市價全平")
+        await _force_close_now(trade, close_side, filt)
+        return False
+
+    # 再掛 N 段止盈；某段若進場時已達 → 市價賣掉那段（直接落袋）
     n = min(len(TP_RATIOS), len(targets))
     portions = _split_portions(Decimal(str(trade["qty"])), n, filt["step"])
-
     tp_orders = []
     for i in range(n):
         qty_i = portions[i]
         if qty_i <= 0:
             continue
         tp_price = _quantize(targets[i]["price"], filt["tick"])
-        resp = await _api(
-            _client.futures_create_order, symbol=symbol, side=close_side,
-            type="TAKE_PROFIT_MARKET", stopPrice=format(tp_price, "f"),
-            quantity=format(qty_i, "f"), reduceOnly="true",
-        )
-        tp_orders.append({"order_id": _oid(resp), "qty": float(qty_i),
-                          "tp": float(tp_price), "level": i + 1})
-        print(f"[trader]   TP{i + 1}: {close_side} {qty_i} @ {tp_price}（reduceOnly）")
+        try:
+            resp = await _api(
+                _client.futures_create_order, symbol=symbol, side=close_side,
+                type="TAKE_PROFIT_MARKET", stopPrice=format(tp_price, "f"),
+                quantity=format(qty_i, "f"), reduceOnly="true",
+            )
+            tp_orders.append({"order_id": _oid(resp), "qty": float(qty_i),
+                              "tp": float(tp_price), "level": i + 1})
+            print(f"[trader]   TP{i + 1}: {close_side} {qty_i} @ {tp_price}（reduceOnly）")
+        except BinanceAPIException as e:
+            if e.code != -2021:
+                raise
+            print(f"[trader] ⚠️ {symbol} TP{i + 1} {tp_price} 進場時已達 → 市價賣出該段 {qty_i}")
+            await _market_close_qty(symbol, close_side, qty_i)
 
-    # 止損：一張 STOP_MARKET closePosition，碰 SL1 直接把整個倉位平掉
-    sl_resp = await _api(
-        _client.futures_create_order, symbol=symbol, side=close_side,
-        type="STOP_MARKET", stopPrice=format(sl1, "f"), closePosition="true",
-    )
-    print(f"[trader]   SL: {close_side} 全平 @ {sl1}（closePosition）")
-    trades.set_oco(trade["id"], {"mode": "futures", "sl_order_id": _oid(sl_resp),
+    trades.set_oco(trade["id"], {"mode": "futures", "sl_order_id": sl_order_id,
                                  "sl_price": float(sl1), "tp_orders": tp_orders})
+    return True
+
+
+async def _force_close_now(trade: dict, close_side: str, filt: dict) -> None:
+    """市價平掉整個倉位、撤殘留單、標記 CLOSED（進場即穿止損時用）。"""
+    symbol = trade["symbol"]
+    pos = await _api(_client.futures_position_information, symbol=symbol)
+    amt = abs(float(pos[0]["positionAmt"])) if pos else 0.0
+    if amt > 0:
+        await _market_close_qty(symbol, close_side, _quantize(amt, filt["step"]))
+    await _cancel_all_futures_orders(symbol)
+    trades.set_status(trade["id"], "CLOSED")
+    print(f"[trader] trade#{trade['id']} {symbol} 已市價平倉 → CLOSED")
 
 
 async def _place_oco_grid(trade: dict) -> None:
