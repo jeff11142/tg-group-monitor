@@ -385,6 +385,13 @@ async def _place_protection_futures(trade: dict) -> bool:
     _, close_side = _sides()
     sl1 = _quantize(signal["stops"][0]["price"], filt["tick"])
 
+    # 先確認真的有持倉才掛保護（重啟回復/延遲時，倉位可能已被平掉或從未開成）
+    pos = await _api(_client.futures_position_information, symbol=symbol)
+    if not pos or abs(float(pos[0]["positionAmt"])) == 0:
+        print(f"[trader] {symbol} 無持倉可保護（可能已平倉），trade#{trade['id']} → CLOSED")
+        trades.set_status(trade["id"], "CLOSED")
+        return False
+
     # 先掛止損；若進場時價格已穿過止損 → 幣安拒 -2021 → 當下直接市價全平
     try:
         sl_resp = await _api(

@@ -61,6 +61,7 @@ class FakeFuturesClient:
         self._oid += 1
         self.created.append({**kw, "orderId": self._oid})
         if kw.get("type") == "LIMIT":
+            self.position_amt = kw.get("quantity", "0")  # 模擬進場成交開倉
             return {"orderId": self._oid, "status": "FILLED",
                     "executedQty": kw.get("quantity", "0")}
         # 條件單（TAKE_PROFIT_MARKET / STOP_MARKET）回 algoId、不含 orderId（如真實合約）
@@ -251,6 +252,22 @@ async def scenario_sl_immediate_trigger():
     check("有送出市價平倉單", len(closes) >= 1)
 
 
+async def scenario_no_position_on_protect():
+    print("\n[合約-9] 掛保護時已無持倉（重啟回復/已平倉）→ 不掛、直接 CLOSED")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient()
+    fake.position_amt = "0"  # 無持倉
+    bt._filters_cache.clear()
+    tid = trades.add("BTCUSDT", 100, 0.3, 999, SIGNAL)
+    trades.set_status(tid, "PENDING_BUY")
+    ok = await bt._place_protection_futures(trades.get(tid))
+    check("回傳 False（沒掛保護）", ok is False)
+    check("沒送出任何條件單", not any(
+        c.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET") for c in fake.created))
+    check("交易標記 CLOSED", trades.get(tid)["status"] == "CLOSED")
+
+
 async def main():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
@@ -269,6 +286,7 @@ async def main():
     await scenario_sl_failsafe_not_breached()
     await scenario_tp_failsafe()
     await scenario_sl_immediate_trigger()
+    await scenario_no_position_on_protect()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 
