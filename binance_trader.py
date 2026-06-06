@@ -42,8 +42,12 @@ POLL_INTERVAL = float(_get("ENTRY_POLL_INTERVAL", "5"))
 FEE_BUFFER_PCT = float(_get("SELL_FEE_BUFFER_PCT", "0.1"))
 # 對帳/收單迴圈的檢查間隔（秒）
 MONITOR_INTERVAL = float(_get("TRADE_MONITOR_INTERVAL", "15"))
-# 是否在第一個止盈成交後，把剩餘止損移到保本（進場價）
+# 是否在止盈成交後啟動動態止損（TP1→保本、之後逐段鎖利）
 BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
+# 淨保本：移到保本時把止損設在「進場價 ×（1 ± 此手續費%）」，涵蓋來回手續費，移動後即使被掃也不虧
+BREAKEVEN_FEE_PCT = float(_get("BREAKEVEN_FEE_PCT", "0.1"))
+# 階梯追蹤止損：TP2 成交後把止損推到 TP1 價、TP3 後推到 TP2 價…逐段鎖利（合約）。0=只在 TP1 做一次保本
+TRAILING_SL = _get("TRAILING_SL", "1") == "1"
 # 限價買單超過幾分鐘未成交就撤單、釋放持倉額度（0=永不超時，一直等成交）
 ENTRY_TIMEOUT_MIN = float(_get("ENTRY_TIMEOUT_MIN", "30"))
 ENTRY_TIMEOUT_SEC = ENTRY_TIMEOUT_MIN * 60
@@ -527,8 +531,11 @@ async def resume() -> None:
 def start_monitor() -> None:
     """啟動背景對帳迴圈：自動收單（#1）+ TP1 後移動停損到保本（#2）。"""
     _spawn(_monitor_loop())
-    print(f"[trader] 對帳迴圈啟動（每 {MONITOR_INTERVAL:g} 秒）"
-          f"{'，TP1 後移動停損到保本' if BREAKEVEN_AFTER_TP1 else ''}")
+    if BREAKEVEN_AFTER_TP1:
+        sl_desc = "，TP1 後逐段追蹤止損（鎖利）" if TRAILING_SL else "，TP1 後移動止損到淨保本"
+    else:
+        sl_desc = ""
+    print(f"[trader] 對帳迴圈啟動（每 {MONITOR_INTERVAL:g} 秒）{sl_desc}")
 
 
 async def _monitor_loop() -> None:
@@ -580,10 +587,9 @@ async def _reconcile_futures(trade: dict) -> None:
         if await _tp_failsafe_futures(trade, info, price):
             return  # 有補平就這輪先收尾，下輪再判斷移保本/收單
 
-    # #2 移動止損到保本：倉位比原始量少 = 有止盈成交（止損會一次全平，不會只少一部分）
-    if (BREAKEVEN_AFTER_TP1 and not trade.get("sl_moved")
-            and amt < float(trade["qty"]) * 0.999):
-        await _move_sl_breakeven_futures(trade, info)
+    # #2 動態止損：依已成交的止盈段數逐段上移止損（TP1→淨保本、TP2→TP1價、TP3→TP2價…）
+    if BREAKEVEN_AFTER_TP1:
+        await _update_trailing_sl_futures(trade, info, amt)
 
 
 def _tp_breached(price: float, tp_price: float) -> bool:
@@ -608,11 +614,7 @@ async def _tp_failsafe_futures(trade: dict, info: dict, price: float) -> bool:
         if not _tp_breached(price, float(tp["tp"])):
             continue
         # 先撤掉該段 TP 條件單（避免等下又自己觸發重複賣），再市價補平該段數量
-        try:
-            await _api(_client.futures_cancel_algo_order, algoId=tp["order_id"])
-        except BinanceAPIException as e:
-            if e.code != -2011:
-                raise
+        await _cancel_conditional(symbol, tp["order_id"])
         qty = _quantize(float(tp["qty"]), filt["step"])
         try:
             await _api(_client.futures_create_order, symbol=symbol, side=close_side,
@@ -631,6 +633,17 @@ def _stop_breached(price: float, sl_price: float) -> bool:
     if TRADE_SIDE == "SHORT":
         return price >= sl_price
     return price <= sl_price
+
+
+def _net_breakeven_price(entry: Decimal) -> Decimal:
+    """淨保本價：把來回手續費算進去，移動後即使被掃也不虧。做多往上加、做空往下減。"""
+    bump = Decimal(str(BREAKEVEN_FEE_PCT)) / Decimal("100")
+    return entry * (Decimal(1) - bump) if TRADE_SIDE == "SHORT" else entry * (Decimal(1) + bump)
+
+
+def _sl_safe_side(target: float, price: float) -> bool:
+    """新止損是否在市價的安全側（做多：低於市價；做空：高於市價），避免一掛就立刻觸發。"""
+    return target > price if TRADE_SIDE == "SHORT" else target < price
 
 
 async def _force_close_futures(trade: dict, amt: float, price: float, sl_price: float) -> None:
@@ -654,32 +667,78 @@ async def _force_close_futures(trade: dict, amt: float, price: float, sl_price: 
     print(f"[trader] trade#{trade['id']} {symbol} 保險絲已平倉 → CLOSED")
 
 
-async def _move_sl_breakeven_futures(trade: dict, info: dict) -> None:
-    """合約：撤掉舊止損、在進場價重掛 closePosition 止損（保本）。"""
+async def _cancel_conditional(symbol: str, order_id) -> None:
+    """撤掉一張條件單（TP/SL）。這些單由 futures_create_order 下、用 orderId 撤；
+    已不存在（-2011）忽略，其他錯誤記 log 但不中斷對帳（避免一張撤不掉就卡死整個迴圈）。"""
+    if not order_id:
+        return
+    try:
+        await _api(_client.futures_cancel_order, symbol=symbol, orderId=order_id)
+    except BinanceAPIException as e:
+        if e.code != -2011:
+            print(f"[trader] 撤條件單 {order_id} 失敗（忽略續行）：{e.code} {e.message}")
+
+
+async def _replace_sl_futures(trade: dict, info: dict, stop_price: Decimal, filt: dict) -> None:
+    """撤掉舊的 closePosition 止損，在 stop_price 重掛一張新的，更新 info。"""
+    symbol = trade["symbol"]
+    _, close_side = _sides()
+    await _cancel_conditional(symbol, info.get("sl_order_id"))
+    resp = await _api(_client.futures_create_order, symbol=symbol, side=close_side,
+                      type="STOP_MARKET", stopPrice=format(stop_price, "f"), closePosition="true")
+    info["sl_order_id"] = _oid(resp)
+    info["sl_price"] = float(stop_price)
+
+
+def _tp_levels_realized(trade: dict, info: dict, amt: float) -> int:
+    """依倉位已減少的量，回推已實現到第幾段止盈（止盈按序成交）。"""
+    tp_orders = sorted(info.get("tp_orders") or [], key=lambda t: t["level"])
+    filled_qty = float(trade["qty"]) - amt
+    tol = float(trade["qty"]) * 0.001
+    tier, cum = 0, 0.0
+    for t in tp_orders:
+        cum += float(t["qty"])
+        if filled_qty >= cum - tol:
+            tier = t["level"]
+        else:
+            break
+    return tier
+
+
+async def _update_trailing_sl_futures(trade: dict, info: dict, amt: float) -> None:
+    """合約動態止損：第 1 段止盈成交→止損移到淨保本；第 k 段(k≥2)成交→止損推到第 (k-1) 段止盈價。
+    沒開 TRAILING_SL 時只在第 1 段做一次保本。"""
+    tp_orders = info.get("tp_orders") or []
+    if not tp_orders:
+        return
+    tier = _tp_levels_realized(trade, info, amt)
+    target_tier = tier if TRAILING_SL else min(tier, 1)
+    current = int(trade.get("sl_moved") or 0)
+    if target_tier < 1 or target_tier <= current:
+        return  # 還沒有止盈成交，或止損已在這個（含更高）層級
+
     symbol = trade["symbol"]
     filt = await _get_filters(symbol)
     entry = Decimal(str(trade["entry"]))
-    _, close_side = _sides()
+    if target_tier == 1:
+        target = _net_breakeven_price(entry)
+        label = f"淨保本（含 {BREAKEVEN_FEE_PCT}% 手續費）"
+    else:
+        prev = next((t for t in tp_orders if t["level"] == target_tier - 1), None)
+        if not prev:
+            return
+        target = Decimal(str(prev["tp"]))
+        label = f"鎖利至 TP{target_tier - 1} 價"
+    be = _quantize(float(target), filt["tick"])
 
     ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
-    price = Decimal(str(ticker["price"]))
-    if entry >= price:
-        return  # 已回落到進場價附近，設保本會讓止損高於市價，維持原止損
+    price = float(ticker["price"])
+    if not _sl_safe_side(float(be), price):
+        return  # 市價已不在安全側（設了會立刻觸發）→ 這次先不動，維持原止損，下輪再試
 
-    be = _quantize(float(entry), filt["tick"])
-    old_sl = info.get("sl_order_id")
-    if old_sl:
-        try:
-            await _api(_client.futures_cancel_algo_order, algoId=old_sl)
-        except BinanceAPIException as e:
-            if e.code != -2011:  # -2011 = 訂單已不存在
-                raise
-    resp = await _api(_client.futures_create_order, symbol=symbol, side=close_side,
-                      type="STOP_MARKET", stopPrice=format(be, "f"), closePosition="true")
-    info["sl_order_id"] = _oid(resp)
-    info["sl_price"] = float(be)
-    trades.update_oco(trade["id"], info, sl_moved=True)
-    print(f"[trader] trade#{trade['id']} {symbol} 止盈已觸發，止損移到保本 {be}")
+    await _replace_sl_futures(trade, info, be, filt)
+    trades.update_oco(trade["id"], info, sl_moved=target_tier)
+    print(f"[trader] trade#{trade['id']} {symbol} 已實現 TP{tier}，止損上移 → {label} {be}")
 
 
 async def _cancel_all_futures_orders(symbol: str) -> None:
@@ -726,13 +785,14 @@ async def _move_sl_to_breakeven(trade: dict, still_open: list, open_orders: list
     filt = await _get_filters(symbol)
     entry = Decimal(str(trade["entry"]))
 
+    be_price = _net_breakeven_price(entry)  # 淨保本：進場價 + 來回手續費
     ticker = await _api(_client.get_symbol_ticker, symbol=symbol)
     price = Decimal(ticker["price"])
-    if entry >= price:
-        return  # 已回落到進場價附近，設保本會讓止損高於市價（OCO 不合法），維持原止損
+    if be_price >= price:
+        return  # 已回落到保本價附近，設保本會讓止損高於市價（OCO 不合法），維持原止損
 
-    be_trigger = _quantize(float(entry), filt["tick"])
-    be_limit = _quantize(float(entry * Decimal(str(1 - SL_LIMIT_BUFFER_PCT / 100))), filt["tick"])
+    be_trigger = _quantize(float(be_price), filt["tick"])
+    be_limit = _quantize(float(be_price * Decimal(str(1 - SL_LIMIT_BUFFER_PCT / 100))), filt["tick"])
     order_by_list = {}
     for o in open_orders:
         order_by_list.setdefault(o["orderListId"], o)

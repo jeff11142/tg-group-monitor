@@ -91,10 +91,11 @@ def set_oco(trade_id: int, oco_orders: list) -> None:
                      (json.dumps(oco_orders), trade_id))
 
 
-def update_oco(trade_id: int, oco_orders: list, sl_moved: bool) -> None:
+def update_oco(trade_id: int, oco_orders: list, sl_moved: int) -> None:
+    """sl_moved：止損移動的層級（0=未移、1=保本、2=鎖 TP1、3=鎖 TP2…）；布林會轉成 0/1。"""
     with _conn() as conn:
         conn.execute("UPDATE trades SET oco_orders = ?, sl_moved = ? WHERE id = ?",
-                     (json.dumps(oco_orders), 1 if sl_moved else 0, trade_id))
+                     (json.dumps(oco_orders), int(sl_moved), trade_id))
 
 
 def count_open() -> int:
