@@ -256,21 +256,21 @@ async def send_bot_dm(http: httpx.AsyncClient, chat_id: int, text: str) -> bool:
 
 
 PUBLIC_COMMANDS = [
-    {"command": "myid", "description": "顯示你的 chat_id"},
-    {"command": "help", "description": "訂閱與使用說明"},
+    {"command": "myid", "description": "顯示你的編號"},
+    {"command": "help", "description": "顯示使用說明"},
 ]
 ADMIN_COMMANDS = [
-    {"command": "sub", "description": "開通/續期訂閱 <id> <天數>"},
-    {"command": "unsub", "description": "停用訂閱 <id>"},
-    {"command": "subs", "description": "列出訂閱者與到期狀態"},
-    {"command": "add", "description": "新增無期限接收者 <id>"},
-    {"command": "remove", "description": "移除接收者 <id>"},
-    {"command": "enable", "description": "啟用接收者 <id>"},
-    {"command": "disable", "description": "暫停接收者 <id>"},
+    {"command": "sub", "description": "開通或續期訂閱"},
+    {"command": "unsub", "description": "停用某人的訂閱"},
+    {"command": "subs", "description": "列出所有訂閱狀態"},
+    {"command": "add", "description": "新增接收者"},
+    {"command": "remove", "description": "移除接收者"},
+    {"command": "enable", "description": "啟用接收者"},
+    {"command": "disable", "description": "暫停接收者"},
     {"command": "list", "description": "列出所有接收者"},
-    {"command": "config", "description": "查看/調整交易參數（按鈕操作）"},
-    {"command": "myid", "description": "顯示你的 chat_id"},
-    {"command": "help", "description": "顯示管理指令說明"},
+    {"command": "config", "description": "查看或調整交易參數"},
+    {"command": "myid", "description": "顯示你的編號"},
+    {"command": "help", "description": "顯示管理說明"},
 ]
 # 管理專用指令（非管理員輸入這些 → 靜默忽略，不回覆）
 ADMIN_ONLY_CMDS = ({"/" + c["command"] for c in ADMIN_COMMANDS}
@@ -321,18 +321,18 @@ async def _subscription_loop() -> None:
 
 
 ADMIN_HELP_TEXT = (
-    "管理員指令：\n"
-    "/sub <chat_id> <天數> [name] — 開通/續期訂閱\n"
-    "/unsub <chat_id> — 停用訂閱\n"
-    "/subs — 列出訂閱者與到期狀態\n"
+    "管理指令（點選後依提示輸入即可）：\n"
+    "/sub — 開通或續期訂閱\n"
+    "/unsub — 停用某人的訂閱\n"
+    "/subs — 列出所有訂閱狀態\n"
     "/list — 列出所有接收者\n"
-    "/add <chat_id> [name] — 新增（無期限）接收者\n"
-    "/remove <chat_id> — 移除接收者\n"
-    "/enable <chat_id> — 啟用接收者\n"
-    "/disable <chat_id> — 暫停接收者\n"
-    "/config — 查看/調整交易參數（點按鈕選參數→輸入新值）\n"
-    "/cancel — 取消正在進行的參數修改\n"
-    "/myid — 顯示自己的 chat_id\n"
+    "/add — 新增接收者\n"
+    "/remove — 移除接收者\n"
+    "/enable — 啟用接收者\n"
+    "/disable — 暫停接收者\n"
+    "/config — 查看或調整交易參數\n"
+    "/cancel — 取消進行中的操作\n"
+    "/myid — 顯示你的編號\n"
     "/help — 顯示此說明"
 )
 
@@ -341,7 +341,7 @@ PUBLIC_HELP_TEXT = (
     "👋 這是交易訊號通知 Bot\n"
     "訂閱後即可即時收到篩選過的交易訊號。\n\n"
     "可用指令：\n"
-    "/myid — 顯示你的 chat_id（開通訂閱時要提供給管理員）\n"
+    "/myid — 顯示你的編號（開通訂閱時要提供給管理員）\n"
     "/help — 顯示這份說明\n\n"
     f"📦 訂閱方案：{SUB_PRICE_USDT} USDT / {SUB_DAYS} 天\n"
     "・直接傳任何訊息給我，即可看到你的 chat_id、目前訂閱狀態與付款方式\n"
@@ -364,7 +364,7 @@ def _remaining_text(expires_at: str | None) -> str:
 def subscription_hint(chat_id: int) -> str:
     """非管理員私訊 bot 時的回覆：chat_id + 訂閱狀態 / 付款指引。"""
     r = recipients.get(chat_id)
-    lines = ["你好！", f"你的 chat_id 是 {chat_id}", ""]
+    lines = ["你好！", f"你的編號是 {chat_id}", ""]
     if r and r["enabled"] and (r["expires_at"] is None or
                                datetime.fromisoformat(r["expires_at"]) > datetime.now(timezone.utc)):
         lines.append(f"✅ 你的訂閱狀態：{_remaining_text(r['expires_at'])}")
@@ -374,7 +374,7 @@ def subscription_hint(chat_id: int) -> str:
             lines.append(f"💰 轉帳 USDT（{SUB_NETWORK}）到：")
             lines.append(SUB_WALLET)
         lines.append("")
-        lines.append(f"付款後請把「你的 chat_id（{chat_id}）」與交易截圖 / TxID 傳給管理員，即可開通。")
+        lines.append(f"付款後請把「你的編號（{chat_id}）」與交易截圖 / TxID 傳給管理員，即可開通。")
     return "\n".join(lines)
 
 
@@ -442,8 +442,18 @@ PARAM_HELP = {
     "max_open_trades": "最大同時持倉筆數，整數 ≥1。",
 }
 
-# admin sender_id -> 正在等待輸入新值的參數 key（互動式修改的狀態）
-_pending_param: dict[int, str] = {}
+# admin sender_id -> 進行中的互動：("param", 參數key) 或 ("cmd", 指令名)
+_pending: dict[int, tuple[str, str]] = {}
+
+# 需要輸入的管理指令：點一下指令後，Bot 發這段中文提示並監聽你下一則回覆
+INTERACTIVE_PROMPTS = {
+    "sub":     "請輸入要開通訂閱的對象編號、天數，名稱可省略，用空格分隔。\n例如：123456789 30 小明",
+    "unsub":   "請輸入要停用訂閱的對象編號。",
+    "add":     "請輸入要新增的接收者編號，名稱可省略，用空格分隔。\n例如：123456789 小明",
+    "remove":  "請輸入要移除的接收者編號。",
+    "enable":  "請輸入要啟用的接收者編號。",
+    "disable": "請輸入要暫停的接收者編號。",
+}
 
 
 def _type_label(conv) -> str:
@@ -503,7 +513,7 @@ async def _handle_admin_command(event, text: str) -> None:
         return
 
     if cmd == "/myid":
-        await event.reply(f"你的 chat_id 是 {event.sender_id}")
+        await event.reply(f"你的編號是 {event.sender_id}")
         return
 
     if cmd == "/help":
@@ -522,12 +532,12 @@ async def _handle_admin_command(event, text: str) -> None:
 
     if cmd == "/sub":
         if len(parts) < 3:
-            await event.reply("用法：/sub <chat_id> <天數> [name]")
+            await event.reply("請輸入：對象編號 天數 名稱（名稱可省略），用空格分隔。")
             return
         try:
             target_id = int(parts[1])
         except ValueError:
-            await event.reply(f"chat_id 必須是數字，收到：{parts[1]!r}")
+            await event.reply(f"編號必須是數字，收到：{parts[1]!r}")
             return
         rest = parts[2].split(None, 1)
         try:
@@ -545,12 +555,12 @@ async def _handle_admin_command(event, text: str) -> None:
 
     if cmd == "/unsub":
         if len(parts) < 2:
-            await event.reply("用法：/unsub <chat_id>")
+            await event.reply("請輸入要停用訂閱的對象編號。")
             return
         try:
             target_id = int(parts[1])
         except ValueError:
-            await event.reply(f"chat_id 必須是數字，收到：{parts[1]!r}")
+            await event.reply(f"編號必須是數字，收到：{parts[1]!r}")
             return
         if recipients.set_enabled(target_id, False):
             await event.reply(f"已停用 {target_id} 的訂閱")
@@ -560,12 +570,12 @@ async def _handle_admin_command(event, text: str) -> None:
 
     if cmd in ("/add", "/remove", "/enable", "/disable"):
         if len(parts) < 2:
-            await event.reply(f"用法：{cmd} <chat_id>" + (" [name]" if cmd == "/add" else ""))
+            await event.reply("請輸入接收者編號" + ("，名稱可省略。" if cmd == "/add" else "。"))
             return
         try:
             target_id = int(parts[1])
         except ValueError:
-            await event.reply(f"chat_id 必須是數字，收到：{parts[1]!r}")
+            await event.reply(f"編號必須是數字，收到：{parts[1]!r}")
             return
 
         if cmd == "/add":
@@ -682,23 +692,34 @@ async def main() -> None:
                 return
             if not text:
                 return
-            # 取消正在進行的參數修改
+            sender = event.sender_id
             if text.lower() == "/cancel":
-                if _pending_param.pop(event.sender_id, None):
-                    await event.reply("已取消修改。")
+                if _pending.pop(sender, None):
+                    await event.reply("已取消。")
                 else:
-                    await event.reply("目前沒有待修改的參數。")
+                    await event.reply("目前沒有進行中的操作。")
                 return
-            # 若此 admin 剛按了參數按鈕、正在等待輸入值，且這次不是指令 → 當成新值套用
-            pending = _pending_param.get(event.sender_id)
+            # 正在等待輸入（參數值或指令參數），且這次不是新指令 → 當成輸入處理
+            pending = _pending.get(sender)
             if pending and not text.startswith("/"):
-                ok, msg = _apply_param(pending, text)
-                if ok:
-                    _pending_param.pop(event.sender_id, None)
-                await event.reply(msg)
+                kind, key = pending
+                if kind == "param":
+                    ok, msg = _apply_param(key, text)
+                    if ok:
+                        _pending.pop(sender, None)
+                    await event.reply(msg)
+                else:  # "cmd"：把輸入接到指令後面，交給原指令邏輯
+                    _pending.pop(sender, None)
+                    await _handle_admin_command(event, f"/{key} {text.strip()}")
                 return
-            # 改打其他指令 → 放棄先前的等待狀態，照常處理指令
-            _pending_param.pop(event.sender_id, None)
+            # 改打新指令 → 放棄先前等待狀態
+            _pending.pop(sender, None)
+            cmd = text.split()[0].lower().split("@")[0]
+            # 需要輸入、且沒附帶參數（純點擊）的指令 → 發中文提示並開始監聽回覆
+            if cmd[1:] in INTERACTIVE_PROMPTS and len(text.split()) == 1:
+                _pending[sender] = ("cmd", cmd[1:])
+                await event.reply(INTERACTIVE_PROMPTS[cmd[1:]] + "\n\n輸入 /cancel 可取消。")
+                return
             await _handle_admin_command(event, text)
 
         @bot_client.on(events.CallbackQuery(pattern=b"setparam:"))
@@ -712,7 +733,7 @@ async def main() -> None:
                 return
             import binance_trader as bt
             attr, _, conv, _ = TUNABLE_PARAMS[key]
-            _pending_param[event.sender_id] = key
+            _pending[event.sender_id] = ("param", key)
             await event.answer()  # 關掉按鈕的 loading 動畫
             await event.respond(
                 f"✏️ 修改 {key}\n"
