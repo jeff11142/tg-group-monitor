@@ -486,6 +486,30 @@ async def _send_target_panel(event, action: str) -> None:
     await event.reply(f"請選擇要{_TARGET_ACTION_LABEL[action]}的對象：", buttons=buttons)
 
 
+async def _send_renew_panel(event) -> None:
+    """/sub：列出訂閱中的對象供續訂（點→確認→續訂）；也可直接打字開通新對象。"""
+    subs = [r for r in recipients.list_all() if r["expires_at"]]
+    if not subs:
+        await event.reply(
+            "目前沒有訂閱中的對象。\n要開通新訂閱，請直接輸入：對象編號 天數 名稱"
+            "（名稱可省略）。\n例如：123456789 30 小明",
+            buttons=[_cancel_row()],
+        )
+        return
+    buttons = []
+    for r in subs:
+        cid = r["chat_id"]
+        name = f"{r['name']}｜" if r["name"] else ""
+        buttons.append([Button.inline(f"{name}{cid}（{_remaining_text(r['expires_at'])}）",
+                                      f"renew:{cid}".encode())])
+    buttons.append(_cancel_row())
+    await event.reply(
+        f"請選擇要續訂的對象（每次續 {SUB_DAYS} 天）；\n"
+        "若要開通新對象，直接輸入：對象編號 天數 名稱（名稱可省略）。",
+        buttons=buttons,
+    )
+
+
 def _type_label(conv) -> str:
     return "整數" if conv is int else "數字"
 
@@ -737,6 +761,10 @@ async def main() -> None:
             name = text.split()[0].lower().split("@")[0][1:]
             # 純點擊（無附帶參數）的指令 → 互動化
             if len(text.split()) == 1:
+                if name == "sub":  # 續訂選按鈕，或打字開通新對象
+                    _pending[sender] = ("cmd", "sub")
+                    await _send_renew_panel(event)
+                    return
                 if name in INTERACTIVE_PROMPTS:  # 新對象／需天數 → 打字
                     _pending[sender] = ("cmd", name)
                     await event.reply(INTERACTIVE_PROMPTS[name], buttons=[_cancel_row()])
@@ -781,6 +809,36 @@ async def main() -> None:
             msg = _do_target_action(action, chat_id)
             await event.answer()
             await event.edit(msg)  # 把名單按鈕換成執行結果
+
+        @bot_client.on(events.CallbackQuery(pattern=b"renew:"))
+        async def _on_renew_select(event):
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            cid = event.data.decode().split(":", 1)[1]
+            r = recipients.get(int(cid))
+            await event.answer()
+            if not r:
+                await event.edit("找不到該對象。")
+                return
+            who = f"{r['name']}（{cid}）" if r["name"] else cid
+            await event.edit(
+                f"確認為 {who} 續訂 {SUB_DAYS} 天？\n目前：{_remaining_text(r['expires_at'])}",
+                buttons=[[Button.inline("✅ 確認續訂", f"renewok:{cid}".encode())], _cancel_row()],
+            )
+
+        @bot_client.on(events.CallbackQuery(pattern=b"renewok:"))
+        async def _on_renew_confirm(event):
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            cid = int(event.data.decode().split(":", 1)[1])
+            new_exp = recipients.subscribe(cid, int(SUB_DAYS))
+            _pending.pop(event.sender_id, None)
+            await event.answer("已續訂")
+            await event.edit(f"已為 {cid} 續訂 {SUB_DAYS} 天，{_remaining_text(new_exp)}")
+            await send_bot_dm(_http, cid,
+                              f"✅ 訂閱已續期！{_remaining_text(new_exp)}\n你將持續收到訊號通知。")
 
         @bot_client.on(events.CallbackQuery(pattern=b"cancel"))
         async def _on_cancel_button(event):
