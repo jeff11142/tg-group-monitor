@@ -482,6 +482,7 @@ async def _send_target_panel(event, action: str) -> None:
         status = "啟用中" if r["enabled"] else "已暫停"
         name = f"{r['name']}｜" if r["name"] else ""
         buttons.append([Button.inline(f"{name}{cid}（{status}）", f"act:{action}:{cid}".encode())])
+    buttons.append(_cancel_row())
     await event.reply(f"請選擇要{_TARGET_ACTION_LABEL[action]}的對象：", buttons=buttons)
 
 
@@ -509,6 +510,11 @@ def _apply_param(key: str, raw: str) -> tuple[bool, str]:
                   "（已寫回 .env，下一筆新進場生效；已開倉位不受影響）")
 
 
+def _cancel_row() -> list:
+    """互動面板／提示最後都附這顆取消按鈕。"""
+    return [Button.inline("✖️ 取消", b"cancel")]
+
+
 async def _send_config_panel(event) -> None:
     """顯示目前交易參數，每個可調參數附一顆 inline 按鈕。"""
     import binance_trader as bt
@@ -520,6 +526,7 @@ async def _send_config_panel(event) -> None:
     env = "TESTNET 測試網" if bt.TESTNET else "⚠️ 正式網（真錢）"
     auto = "開" if bt.AUTO_MIN_AMOUNT else "關"
     lines.append(f"（環境：{env}｜自動最小金額：{auto}）")
+    buttons.append(_cancel_row())
     await event.respond("\n".join(lines), buttons=buttons)
 
 
@@ -732,7 +739,7 @@ async def main() -> None:
             if len(text.split()) == 1:
                 if name in INTERACTIVE_PROMPTS:  # 新對象／需天數 → 打字
                     _pending[sender] = ("cmd", name)
-                    await event.reply(INTERACTIVE_PROMPTS[name] + "\n\n輸入 /cancel 可取消。")
+                    await event.reply(INTERACTIVE_PROMPTS[name], buttons=[_cancel_row()])
                     return
                 if name in _TARGET_ACTION_LABEL:  # 既有對象 → 名單按鈕選人
                     await _send_target_panel(event, name)
@@ -756,7 +763,8 @@ async def main() -> None:
                 f"✏️ 修改 {key}\n"
                 f"目前值：{_fmt_val(getattr(bt, attr))}\n"
                 f"說明：{PARAM_HELP.get(key, '')}\n\n"
-                f"請直接輸入新值（{_type_label(conv)}），輸入 /cancel 取消。"
+                f"請直接輸入新值（{_type_label(conv)}）。",
+                buttons=[_cancel_row()],
             )
 
         @bot_client.on(events.CallbackQuery(pattern=b"act:"))
@@ -773,6 +781,15 @@ async def main() -> None:
             msg = _do_target_action(action, chat_id)
             await event.answer()
             await event.edit(msg)  # 把名單按鈕換成執行結果
+
+        @bot_client.on(events.CallbackQuery(pattern=b"cancel"))
+        async def _on_cancel_button(event):
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            _pending.pop(event.sender_id, None)
+            await event.answer()
+            await event.edit("已取消。")
 
     # 設定 bot 指令選單（一般／管理員分流）＋ 訂閱到期背景檢查
     if BOT_TOKEN:
