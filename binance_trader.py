@@ -668,12 +668,12 @@ async def _force_close_futures(trade: dict, amt: float, price: float, sl_price: 
 
 
 async def _cancel_conditional(symbol: str, order_id) -> None:
-    """撤掉一張條件單（TP/SL）。這些單由 futures_create_order 下、用 orderId 撤；
-    已不存在（-2011）忽略，其他錯誤記 log 但不中斷對帳（避免一張撤不掉就卡死整個迴圈）。"""
+    """撤掉一張條件單（TP/SL）。這些是 closePosition/reduceOnly 的 algo 條件單，要用 algoId 撤
+    （回傳結構沒有一般單的 type/orderId 欄位）。已不存在（-2011）忽略，其他錯誤記 log 但不中斷對帳。"""
     if not order_id:
         return
     try:
-        await _api(_client.futures_cancel_order, symbol=symbol, orderId=order_id)
+        await _api(_client.futures_cancel_algo_order, algoId=order_id)
     except BinanceAPIException as e:
         if e.code != -2011:
             print(f"[trader] 撤條件單 {order_id} 失敗（忽略續行）：{e.code} {e.message}")
