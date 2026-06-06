@@ -445,15 +445,44 @@ PARAM_HELP = {
 # admin sender_id -> 進行中的互動：("param", 參數key) 或 ("cmd", 指令名)
 _pending: dict[int, tuple[str, str]] = {}
 
-# 需要輸入的管理指令：點一下指令後，Bot 發這段中文提示並監聽你下一則回覆
+# 需要打字輸入的管理指令（新對象／需要天數）：點一下後 Bot 發提示並監聽你的回覆
 INTERACTIVE_PROMPTS = {
-    "sub":     "請輸入要開通訂閱的對象編號、天數，名稱可省略，用空格分隔。\n例如：123456789 30 小明",
-    "unsub":   "請輸入要停用訂閱的對象編號。",
-    "add":     "請輸入要新增的接收者編號，名稱可省略，用空格分隔。\n例如：123456789 小明",
-    "remove":  "請輸入要移除的接收者編號。",
-    "enable":  "請輸入要啟用的接收者編號。",
-    "disable": "請輸入要暫停的接收者編號。",
+    "sub": "請輸入要開通訂閱的對象編號、天數，名稱可省略，用空格分隔。\n例如：123456789 30 小明",
+    "add": "請輸入要新增的接收者編號，名稱可省略，用空格分隔。\n例如：123456789 小明",
 }
+
+# 對「既有接收者」操作的指令：點一下後列出名單按鈕，點某人即執行
+_TARGET_ACTION_LABEL = {
+    "remove": "移除", "enable": "啟用", "disable": "暫停", "unsub": "停用訂閱",
+}
+
+
+def _do_target_action(action: str, chat_id: int) -> str:
+    """對既有接收者執行單一操作，回傳結果訊息。"""
+    if action == "remove":
+        return f"已移除 {chat_id}" if recipients.remove(chat_id) else f"找不到 {chat_id}"
+    if action == "enable":
+        return f"已啟用 {chat_id}" if recipients.set_enabled(chat_id, True) else f"找不到 {chat_id}"
+    if action == "disable":
+        return f"已暫停 {chat_id}" if recipients.set_enabled(chat_id, False) else f"找不到 {chat_id}"
+    if action == "unsub":
+        return f"已停用 {chat_id} 的訂閱" if recipients.set_enabled(chat_id, False) else f"找不到 {chat_id}"
+    return "未知操作"
+
+
+async def _send_target_panel(event, action: str) -> None:
+    """列出目前接收者，每位一顆按鈕，點下去即對該位執行 action。"""
+    items = recipients.list_all()
+    if not items:
+        await event.reply("目前沒有任何接收者。")
+        return
+    buttons = []
+    for r in items:
+        cid = r["chat_id"]
+        status = "啟用中" if r["enabled"] else "已暫停"
+        name = f"{r['name']}｜" if r["name"] else ""
+        buttons.append([Button.inline(f"{name}{cid}（{status}）", f"act:{action}:{cid}".encode())])
+    await event.reply(f"請選擇要{_TARGET_ACTION_LABEL[action]}的對象：", buttons=buttons)
 
 
 def _type_label(conv) -> str:
@@ -562,10 +591,7 @@ async def _handle_admin_command(event, text: str) -> None:
         except ValueError:
             await event.reply(f"編號必須是數字，收到：{parts[1]!r}")
             return
-        if recipients.set_enabled(target_id, False):
-            await event.reply(f"已停用 {target_id} 的訂閱")
-        else:
-            await event.reply(f"找不到 {target_id}")
+        await event.reply(_do_target_action("unsub", target_id))
         return
 
     if cmd in ("/add", "/remove", "/enable", "/disable"):
@@ -585,21 +611,8 @@ async def _handle_admin_command(event, text: str) -> None:
                 await event.reply(f"已新增 {target_id}{tag}")
             else:
                 await event.reply(f"{target_id} 已存在，不重複新增")
-        elif cmd == "/remove":
-            if recipients.remove(target_id):
-                await event.reply(f"已移除 {target_id}")
-            else:
-                await event.reply(f"找不到 {target_id}")
-        elif cmd == "/enable":
-            if recipients.set_enabled(target_id, True):
-                await event.reply(f"已啟用 {target_id}")
-            else:
-                await event.reply(f"找不到 {target_id}")
-        elif cmd == "/disable":
-            if recipients.set_enabled(target_id, False):
-                await event.reply(f"已暫停 {target_id}")
-            else:
-                await event.reply(f"找不到 {target_id}")
+        else:
+            await event.reply(_do_target_action(cmd[1:], target_id))
         return
 
     await event.reply("未知指令，輸入 /help 看可用指令")
@@ -714,12 +727,16 @@ async def main() -> None:
                 return
             # 改打新指令 → 放棄先前等待狀態
             _pending.pop(sender, None)
-            cmd = text.split()[0].lower().split("@")[0]
-            # 需要輸入、且沒附帶參數（純點擊）的指令 → 發中文提示並開始監聽回覆
-            if cmd[1:] in INTERACTIVE_PROMPTS and len(text.split()) == 1:
-                _pending[sender] = ("cmd", cmd[1:])
-                await event.reply(INTERACTIVE_PROMPTS[cmd[1:]] + "\n\n輸入 /cancel 可取消。")
-                return
+            name = text.split()[0].lower().split("@")[0][1:]
+            # 純點擊（無附帶參數）的指令 → 互動化
+            if len(text.split()) == 1:
+                if name in INTERACTIVE_PROMPTS:  # 新對象／需天數 → 打字
+                    _pending[sender] = ("cmd", name)
+                    await event.reply(INTERACTIVE_PROMPTS[name] + "\n\n輸入 /cancel 可取消。")
+                    return
+                if name in _TARGET_ACTION_LABEL:  # 既有對象 → 名單按鈕選人
+                    await _send_target_panel(event, name)
+                    return
             await _handle_admin_command(event, text)
 
         @bot_client.on(events.CallbackQuery(pattern=b"setparam:"))
@@ -741,6 +758,21 @@ async def main() -> None:
                 f"說明：{PARAM_HELP.get(key, '')}\n\n"
                 f"請直接輸入新值（{_type_label(conv)}），輸入 /cancel 取消。"
             )
+
+        @bot_client.on(events.CallbackQuery(pattern=b"act:"))
+        async def _on_action_button(event):
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            try:
+                _, action, cid = event.data.decode().split(":", 2)
+                chat_id = int(cid)
+            except (ValueError, UnicodeDecodeError):
+                await event.answer("資料格式錯誤")
+                return
+            msg = _do_target_action(action, chat_id)
+            await event.answer()
+            await event.edit(msg)  # 把名單按鈕換成執行結果
 
     # 設定 bot 指令選單（一般／管理員分流）＋ 訂閱到期背景檢查
     if BOT_TOKEN:
