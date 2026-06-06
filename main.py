@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 
 import recipients
 
@@ -268,6 +268,7 @@ ADMIN_COMMANDS = [
     {"command": "enable", "description": "啟用接收者 <id>"},
     {"command": "disable", "description": "暫停接收者 <id>"},
     {"command": "list", "description": "列出所有接收者"},
+    {"command": "config", "description": "查看/調整交易參數（按鈕操作）"},
     {"command": "myid", "description": "顯示你的 chat_id"},
     {"command": "help", "description": "顯示管理指令說明"},
 ]
@@ -329,8 +330,22 @@ ADMIN_HELP_TEXT = (
     "/remove <chat_id> — 移除接收者\n"
     "/enable <chat_id> — 啟用接收者\n"
     "/disable <chat_id> — 暫停接收者\n"
+    "/config — 查看/調整交易參數（點按鈕選參數→輸入新值）\n"
+    "/cancel — 取消正在進行的參數修改\n"
     "/myid — 顯示自己的 chat_id\n"
     "/help — 顯示此說明"
+)
+
+# 一般使用者（非管理員）的 /help 說明
+PUBLIC_HELP_TEXT = (
+    "👋 這是交易訊號通知 Bot\n"
+    "訂閱後即可即時收到篩選過的交易訊號。\n\n"
+    "可用指令：\n"
+    "/myid — 顯示你的 chat_id（開通訂閱時要提供給管理員）\n"
+    "/help — 顯示這份說明\n\n"
+    f"📦 訂閱方案：{SUB_PRICE_USDT} USDT / {SUB_DAYS} 天\n"
+    "・直接傳任何訊息給我，即可看到你的 chat_id、目前訂閱狀態與付款方式\n"
+    "・付款後把你的 chat_id 與交易截圖 / TxID 傳給管理員即可開通"
 )
 
 
@@ -369,9 +384,113 @@ def _format_recipient_line(r: dict) -> str:
     return f"{flag} {r['chat_id']}{name} — {_remaining_text(r.get('expires_at'))}"
 
 
+def _v_leverage(v: float) -> str | None:
+    return None if 1 <= v <= 125 else "槓桿需在 1~125 之間"
+
+
+def _v_positive(v: float) -> str | None:
+    return None if v > 0 else "必須大於 0"
+
+
+def _v_max_open(v: float) -> str | None:
+    return None if v >= 1 else "至少要 1"
+
+
+# 可由 Bot 即時調整的交易參數：
+#   bot_key -> (binance_trader 模組屬性, .env 鍵名, 轉型函式, 範圍檢查)
+TUNABLE_PARAMS = {
+    "leverage":        ("LEVERAGE",        "LEVERAGE",        int,   _v_leverage),
+    "min_amount_mult": ("MIN_AMOUNT_MULT", "MIN_AMOUNT_MULT", float, _v_positive),
+    "max_open_trades": ("MAX_OPEN_TRADES", "MAX_OPEN_TRADES", int,   _v_max_open),
+}
+
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def _fmt_val(v) -> str:
+    """整數值的 float 顯示成 10 而非 10.0。"""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _update_env_file(env_key: str, value_str: str) -> None:
+    """只改 .env 中 env_key 那一行的值（找不到就附加），保留其餘內容與註解。"""
+    new_line = f"{env_key}={value_str}\n"
+    try:
+        with open(_ENV_PATH, encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    for i, ln in enumerate(lines):
+        s = ln.lstrip()
+        if s.startswith(f"{env_key}=") and not s.startswith("#"):
+            lines[i] = new_line
+            break
+    else:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(new_line)
+    with open(_ENV_PATH, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+# 每個可調參數的說明文字（按下按鈕後回給管理員，提示要輸入什麼）
+PARAM_HELP = {
+    "leverage": "槓桿倍數，整數 1~125。每筆進場前套用。",
+    "min_amount_mult": "最小金額倍數，>0 的數。最小可下量 × 此倍數 = 投入保證金本金。",
+    "max_open_trades": "最大同時持倉筆數，整數 ≥1。",
+}
+
+# admin sender_id -> 正在等待輸入新值的參數 key（互動式修改的狀態）
+_pending_param: dict[int, str] = {}
+
+
+def _type_label(conv) -> str:
+    return "整數" if conv is int else "數字"
+
+
+def _apply_param(key: str, raw: str) -> tuple[bool, str]:
+    """驗證並套用單一參數：同步改 runtime 全域 + 寫回 .env。回傳 (成功, 回覆訊息)。"""
+    attr, env_key, conv, check = TUNABLE_PARAMS[key]
+    raw = raw.strip()
+    try:
+        value = conv(raw)
+    except ValueError:
+        return False, (f"❌ {key} 需要{_type_label(conv)}，收到 {raw!r}，"
+                       "請重新輸入（/cancel 取消）")
+    err = check(value)
+    if err:
+        return False, f"❌ {key} {err}（收到 {_fmt_val(value)}），請重新輸入（/cancel 取消）"
+    import binance_trader as bt
+    old = getattr(bt, attr)
+    setattr(bt, attr, value)
+    _update_env_file(env_key, _fmt_val(value))
+    return True, (f"✅ {key}：{_fmt_val(old)} → {_fmt_val(value)}"
+                  "（已寫回 .env，下一筆新進場生效；已開倉位不受影響）")
+
+
+async def _send_config_panel(event) -> None:
+    """顯示目前交易參數，每個可調參數附一顆 inline 按鈕。"""
+    import binance_trader as bt
+    lines = ["📊 目前交易參數（點下方按鈕修改）："]
+    buttons = []
+    for key, (attr, _, _, _) in TUNABLE_PARAMS.items():
+        lines.append(f"  {key} = {_fmt_val(getattr(bt, attr))}")
+        buttons.append([Button.inline(f"✏️ 改 {key}", f"setparam:{key}".encode())])
+    env = "TESTNET 測試網" if bt.TESTNET else "⚠️ 正式網（真錢）"
+    auto = "開" if bt.AUTO_MIN_AMOUNT else "關"
+    lines.append(f"（環境：{env}｜自動最小金額：{auto}）")
+    await event.respond("\n".join(lines), buttons=buttons)
+
+
 async def _handle_admin_command(event, text: str) -> None:
     parts = text.split(None, 2)  # 切最多 3 段：cmd, arg1, rest
     cmd = parts[0].lower()
+
+    if cmd == "/config":
+        await _send_config_panel(event)
+        return
 
     if cmd == "/list":
         items = recipients.list_all()
@@ -556,10 +675,51 @@ async def main() -> None:
                 cmd = text.split()[0].lower().split("@")[0] if text else ""
                 if cmd in ADMIN_ONLY_CMDS:
                     return  # 非管理員輸入管理指令 → 無權限，靜默忽略不回覆
+                if cmd == "/help":
+                    await event.reply(PUBLIC_HELP_TEXT)
+                    return
                 await event.reply(subscription_hint(event.sender_id))
                 return
-            if text:
-                await _handle_admin_command(event, text)
+            if not text:
+                return
+            # 取消正在進行的參數修改
+            if text.lower() == "/cancel":
+                if _pending_param.pop(event.sender_id, None):
+                    await event.reply("已取消修改。")
+                else:
+                    await event.reply("目前沒有待修改的參數。")
+                return
+            # 若此 admin 剛按了參數按鈕、正在等待輸入值，且這次不是指令 → 當成新值套用
+            pending = _pending_param.get(event.sender_id)
+            if pending and not text.startswith("/"):
+                ok, msg = _apply_param(pending, text)
+                if ok:
+                    _pending_param.pop(event.sender_id, None)
+                await event.reply(msg)
+                return
+            # 改打其他指令 → 放棄先前的等待狀態，照常處理指令
+            _pending_param.pop(event.sender_id, None)
+            await _handle_admin_command(event, text)
+
+        @bot_client.on(events.CallbackQuery(pattern=b"setparam:"))
+        async def _on_param_button(event):
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            key = event.data.decode().split(":", 1)[1]
+            if key not in TUNABLE_PARAMS:
+                await event.answer("未知參數")
+                return
+            import binance_trader as bt
+            attr, _, conv, _ = TUNABLE_PARAMS[key]
+            _pending_param[event.sender_id] = key
+            await event.answer()  # 關掉按鈕的 loading 動畫
+            await event.respond(
+                f"✏️ 修改 {key}\n"
+                f"目前值：{_fmt_val(getattr(bt, attr))}\n"
+                f"說明：{PARAM_HELP.get(key, '')}\n\n"
+                f"請直接輸入新值（{_type_label(conv)}），輸入 /cancel 取消。"
+            )
 
     # 設定 bot 指令選單（一般／管理員分流）＋ 訂閱到期背景檢查
     if BOT_TOKEN:
