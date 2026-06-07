@@ -105,7 +105,12 @@ def init() -> None:
     trades.init()
     net = "TESTNET 測試網" if TESTNET else "⚠️ 正式網（真錢）"
     market = f"合約 {LEVERAGE}x {MARGIN_TYPE} {TRADE_SIDE}" if FUTURES else "現貨 LONG"
-    amount_desc = "依交易對自動取最小" if AUTO_MIN_AMOUNT else f"固定 {TRADE_USDT} USDT"
+    if AUTO_MIN_AMOUNT:
+        amount_desc = "依交易對自動取最小"
+    elif FUTURES and MARGIN_USDT > 0:
+        amount_desc = f"固定本金 {MARGIN_USDT:g} × {LEVERAGE}x = 名目 {MARGIN_USDT * LEVERAGE:g} USDT"
+    else:
+        amount_desc = f"固定名目 {TRADE_USDT:g} USDT"
     print(f"[trader] 幣安自動交易啟用：{market} | {net} | 每筆 {amount_desc} | "
           f"最多同時 {MAX_OPEN_TRADES} 筆 | 分批 {TP_RATIOS}")
 
@@ -551,26 +556,47 @@ def start_monitor() -> None:
 async def _monitor_loop() -> None:
     while True:
         try:
-            for trade in trades.list_status("ACTIVE"):
-                await _reconcile(trade)
+            actives = trades.list_status("ACTIVE")
+            # 一輪只抓一次帳戶級快照（全部持倉/條件單/現價），所有 ACTIVE 共用，
+            # 避免逐筆逐 symbol 打 REST 把 IP 打到限流被 ban（-1003）。
+            snap = await _account_snapshot() if (actives and FUTURES) else None
+            for trade in actives:
+                await _reconcile(trade, snap)
         except Exception as e:
             print(f"[trader] 對帳迴圈錯誤：{e}")
         await asyncio.sleep(MONITOR_INTERVAL)
 
 
-async def _reconcile(trade: dict) -> None:
+async def _account_snapshot() -> dict:
+    """一輪一次：抓全帳戶持倉、全條件單、全現價，建成查表供本輪所有交易共用。
+    把「N 筆 × 每筆數個 REST」壓成固定 3 個請求，是避免 -1003 限流的關鍵。"""
+    pos = await _api(_client.futures_position_information)
+    cond = await _api(_client.futures_get_open_orders, conditional=True)
+    tickers = await _api(_client.futures_symbol_ticker)
+    return {
+        "pos": {p["symbol"]: abs(float(p["positionAmt"])) for p in pos},
+        "open_cond_ids": {(o.get("orderId") or o.get("algoId")) for o in cond},
+        "prices": {t["symbol"]: float(t["price"]) for t in tickers},
+    }
+
+
+async def _reconcile(trade: dict, snap: dict | None = None) -> None:
     if FUTURES:
-        await _reconcile_futures(trade)
+        await _reconcile_futures(trade, snap)
     else:
         await _reconcile_spot(trade)
 
 
-async def _reconcile_futures(trade: dict) -> None:
-    """合約：倉位歸零就收單；倉位減少（有止盈成交）就把止損移到保本。"""
+async def _reconcile_futures(trade: dict, snap: dict | None = None) -> None:
+    """合約：倉位歸零就收單；倉位減少（有止盈成交）就把止損移到保本。
+    snap=帳戶級快照（對帳迴圈傳入，省 REST）；None 時退回逐 symbol 查詢（單筆測試用）。"""
     symbol = trade["symbol"]
     info = trade.get("oco_orders") or {}
-    pos = await _api(_client.futures_position_information, symbol=symbol)
-    amt = abs(float(pos[0]["positionAmt"])) if pos else 0.0
+    if snap is not None:
+        amt = snap["pos"].get(symbol, 0.0)
+    else:
+        pos = await _api(_client.futures_position_information, symbol=symbol)
+        amt = abs(float(pos[0]["positionAmt"])) if pos else 0.0
 
     # #1 自動收單：倉位歸零 = 已全平 → 撤掉殘留止盈止損單、標記 CLOSED
     if amt == 0:
@@ -584,8 +610,11 @@ async def _reconcile_futures(trade: dict) -> None:
     need_price = (SL_FAILSAFE and sl_prices) or (TP_FAILSAFE and info.get("tp_orders"))
     price = 0.0
     if need_price:
-        ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
-        price = float(ticker.get("price") or 0)
+        if snap is not None:
+            price = snap["prices"].get(symbol, 0.0)
+        else:
+            ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
+            price = float(ticker.get("price") or 0)
 
     # 止損保險絲：價格穿過「最深的那道止損」但倉位還在 → 主動市價「全平」兜底
     if SL_FAILSAFE and sl_prices and price > 0:
@@ -596,12 +625,12 @@ async def _reconcile_futures(trade: dict) -> None:
 
     # 止盈保險絲：價格穿過某段止盈但該段條件單還掛著沒成交 → 市價「逐段補平」
     if TP_FAILSAFE and price > 0 and info.get("tp_orders"):
-        if await _tp_failsafe_futures(trade, info, price):
+        if await _tp_failsafe_futures(trade, info, price, snap):
             return  # 有補平就這輪先收尾，下輪再判斷止損上移/收單
 
     # #2 雙軌動態止損：每段 TP 成交後，撤兩道止損、在階梯新階重掛（各取剩餘半倉）
     if BREAKEVEN_AFTER_TP1:
-        await _update_dual_sl_futures(trade, info, amt)
+        await _update_dual_sl_futures(trade, info, amt, snap)
 
 
 def _tp_breached(price: float, tp_price: float) -> bool:
@@ -611,13 +640,17 @@ def _tp_breached(price: float, tp_price: float) -> bool:
     return price >= tp_price
 
 
-async def _tp_failsafe_futures(trade: dict, info: dict, price: float) -> bool:
+async def _tp_failsafe_futures(trade: dict, info: dict, price: float,
+                               snap: dict | None = None) -> bool:
     """逐段檢查：某段 TP 條件單還掛著、但價格已達該 TP → 市價補平那一段。回傳是否有動作。"""
     symbol = trade["symbol"]
     _, close_side = _sides()
     filt = await _get_filters(symbol)
-    cond = await _api(_client.futures_get_open_orders, symbol=symbol, conditional=True)
-    open_ids = {(o.get("orderId") or o.get("algoId")) for o in cond}
+    if snap is not None:
+        open_ids = snap["open_cond_ids"]
+    else:
+        cond = await _api(_client.futures_get_open_orders, symbol=symbol, conditional=True)
+        open_ids = {(o.get("orderId") or o.get("algoId")) for o in cond}
 
     acted = False
     for tp in info.get("tp_orders") or []:
@@ -741,11 +774,14 @@ async def _place_dual_sls(symbol: str, sl_hi: float, sl_lo: float,
     return ids, prices
 
 
-async def _tp_levels_realized(symbol: str, info: dict) -> int:
+async def _tp_levels_realized(symbol: str, info: dict, snap: dict | None = None) -> int:
     """用「TP 掛單是否還在」判定已成交到第幾段（止盈按序成交）。
     以掛單為準，不用倉位減少量，避免止損先觸發造成倉位變少被誤判成 TP 成交。"""
-    cond = await _api(_client.futures_get_open_orders, symbol=symbol, conditional=True)
-    open_ids = {(o.get("orderId") or o.get("algoId")) for o in cond}
+    if snap is not None:
+        open_ids = snap["open_cond_ids"]
+    else:
+        cond = await _api(_client.futures_get_open_orders, symbol=symbol, conditional=True)
+        open_ids = {(o.get("orderId") or o.get("algoId")) for o in cond}
     tier = 0
     for t in sorted(info.get("tp_orders") or [], key=lambda x: x["level"]):
         if t["order_id"] not in open_ids:
@@ -755,13 +791,14 @@ async def _tp_levels_realized(symbol: str, info: dict) -> int:
     return tier
 
 
-async def _update_dual_sl_futures(trade: dict, info: dict, amt: float) -> None:
+async def _update_dual_sl_futures(trade: dict, info: dict, amt: float,
+                                  snap: dict | None = None) -> None:
     """雙軌動態止損：每多成交一段 TP，撤掉兩道舊止損，在階梯新一階重掛、各取當下剩餘的一半。
     上軌=rung[tier+1]、下軌=rung[tier]（rung=[訊號SL2, 訊號SL1×倍數, 淨保本, TP1, TP2…]）。"""
     if not info.get("tp_orders"):
         return
     symbol = trade["symbol"]
-    tier = await _tp_levels_realized(symbol, info)
+    tier = await _tp_levels_realized(symbol, info, snap)
     current = int(trade.get("sl_moved") or 0)
     if tier < 1 or tier <= current:
         return  # 還沒多成交 TP，或止損已在這個（含更高）階
@@ -773,9 +810,12 @@ async def _update_dual_sl_futures(trade: dict, info: dict, amt: float) -> None:
     sl_hi = _quantize(rungs[tier + 1], filt["tick"])
     sl_lo = _quantize(rungs[tier], filt["tick"])
 
-    ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
-    price = float(ticker["price"])
-    if not _sl_safe_side(float(sl_hi), price):
+    if snap is not None:
+        price = snap["prices"].get(symbol, 0.0)
+    else:
+        ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
+        price = float(ticker["price"])
+    if price <= 0 or not _sl_safe_side(float(sl_hi), price):
         return  # 上軌已不在市價安全側（設了會立刻觸發）→ 這輪先不動，下輪再試
 
     # 撤掉舊的兩道止損（含相容舊版單張 sl_order_id）
