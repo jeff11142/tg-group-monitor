@@ -867,6 +867,7 @@ async def main() -> None:
         trader.init()
         await trader.resume()
         trader.start_monitor()
+        await trader.start_user_stream()
 
     bot_cmd_status = f"開（admin={admin_id}）" if bot_client else "關"
     print(f"開始監聽：{SOURCE_CHAT}")

@@ -6,7 +6,8 @@
   reduce-only 半倉止損（上軌 SL1、下軌 SL2）。每段 TP 成交後撤掉兩道止損、在階梯新階重掛
   （各取當下剩餘半倉），達成逐段鎖利。槓桿/保證金模式由 LEVERAGE/MARGIN_TYPE 設定。
 
-策略：進場一次掛好止盈與雙軌止損；對帳迴圈負責收單、保險絲兜底、與雙軌止損逐段上移。
+策略：進場一次掛好止盈與雙軌止損；之後由 WebSocket（User Data Stream）即時反應訂單成交
+（TP 成交→止損上移、倉位歸零→收單），另有慢速對帳迴圈當保險絲兜底/補網/重啟回復。
 
 ⚠️ 預設連 testnet（假錢）。合約 testnet 與現貨 testnet 是不同網站、不同金鑰。
    現貨：testnet.binance.vision；合約：testnet.binancefuture.com
@@ -17,6 +18,7 @@ import os
 import time
 from decimal import ROUND_DOWN, Decimal
 
+from binance import AsyncClient, BinanceSocketManager
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
@@ -43,8 +45,8 @@ SL_LIMIT_BUFFER_PCT = float(_get("SL_LIMIT_BUFFER_PCT", "0.3"))
 POLL_INTERVAL = float(_get("ENTRY_POLL_INTERVAL", "5"))
 # 賣單預留的手續費緩衝（%）：用買進數量拆單時扣掉，避免「賣超」實得數量
 FEE_BUFFER_PCT = float(_get("SELL_FEE_BUFFER_PCT", "0.1"))
-# 對帳/收單迴圈的檢查間隔（秒）
-MONITOR_INTERVAL = float(_get("TRADE_MONITOR_INTERVAL", "15"))
+# 失效保險絲/補網迴圈間隔（秒）：即時反應已交給 WebSocket，這支只當慢速兜底（漏訊息/斷線/重啟回復）
+MONITOR_INTERVAL = float(_get("TRADE_MONITOR_INTERVAL", "120"))
 # 是否在止盈成交後啟動動態止損（TP1→保本、之後逐段鎖利）
 BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
 # 淨保本：移到保本時把止損設在「進場價 ×（1 ± 此手續費%）」，涵蓋來回手續費，移動後即使被掃也不虧
@@ -89,6 +91,10 @@ _filters_cache: dict = {}
 _entry_lock = asyncio.Lock()
 # 保留背景任務參考，避免事件迴圈只持弱參考導致任務被 GC（Python asyncio 官方警告）
 _bg_tasks: set = set()
+# User Data Stream（WebSocket）用的非同步 client；與同步 _client 並存
+_async_client: AsyncClient | None = None
+# 止損上移鎖：WS 即時事件與慢速保險絲都可能觸發，序列化避免重複撤單/掛單
+_sl_update_lock = asyncio.Lock()
 
 
 def _spawn(coro) -> None:
@@ -547,10 +553,93 @@ async def resume() -> None:
 
 
 def start_monitor() -> None:
-    """啟動背景對帳迴圈：自動收單（#1）+ TP1 後移動停損到保本（#2）。"""
+    """啟動背景保險絲迴圈（慢速兜底）：自動收單、止損補網、TP 後止損上移。"""
     _spawn(_monitor_loop())
     sl_desc = "，雙軌半倉止損逐段上移（階梯鎖利）" if BREAKEVEN_AFTER_TP1 else ""
-    print(f"[trader] 對帳迴圈啟動（每 {MONITOR_INTERVAL:g} 秒）{sl_desc}")
+    print(f"[trader] 保險絲對帳迴圈啟動（每 {MONITOR_INTERVAL:g} 秒）{sl_desc}")
+
+
+async def start_user_stream() -> None:
+    """啟動 User Data Stream（WebSocket）：訂單成交即時推播，取代高頻輪詢，避免 -1003 限流。"""
+    if not FUTURES:
+        return
+    _spawn(_user_stream_loop())
+
+
+async def _user_stream_loop() -> None:
+    """連線 futures user socket，逐則處理；斷線指數退避重連。listenKey 保活由套件內部處理。"""
+    global _async_client
+    backoff = 1
+    while True:
+        try:
+            _async_client = await AsyncClient.create(API_KEY, API_SECRET, testnet=TESTNET)
+            bsm = BinanceSocketManager(_async_client)
+            async with bsm.futures_user_socket() as stream:
+                print("[trader] WebSocket 已連線，即時監聽訂單/倉位更新")
+                backoff = 1
+                while True:
+                    msg = await stream.recv()
+                    if not msg or msg.get("e") == "error":
+                        print(f"[trader] WS 收到錯誤/空訊息，重連：{msg}")
+                        break
+                    await _on_user_event(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[trader] WS 中斷，{backoff}s 後重連：{e!r}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        finally:
+            if _async_client is not None:
+                try:
+                    await _async_client.close_connection()
+                except Exception:
+                    pass
+                _async_client = None
+
+
+async def _on_user_event(msg: dict) -> None:
+    """分流 User Data Stream 事件；目前只處理訂單成交（ORDER_TRADE_UPDATE）。"""
+    try:
+        if msg.get("e") == "ORDER_TRADE_UPDATE":
+            await _on_order_filled(msg.get("o") or {})
+    except Exception as e:
+        print(f"[trader] WS 事件處理失敗：{e!r}")
+
+
+def _find_active_trade_by_order(symbol: str, oid) -> dict | None:
+    """用訂單 ID 找出這是哪一筆 ACTIVE 交易的止盈/止損單。"""
+    for t in trades.list_status("ACTIVE"):
+        if t["symbol"] != symbol:
+            continue
+        info = t.get("oco_orders") or {}
+        ids = {x.get("order_id") for x in info.get("tp_orders") or []}
+        ids.update(info.get("sl_orders") or [])
+        if info.get("sl_order_id"):
+            ids.add(info["sl_order_id"])
+        if oid in ids:
+            return t
+    return None
+
+
+async def _on_order_filled(o: dict) -> None:
+    """我們掛的某張 TP/SL 成交了：倉位歸零就收單；否則（多半是 TP 成交）把雙軌止損上移。"""
+    if o.get("X") != "FILLED":
+        return
+    symbol, oid = o.get("s"), o.get("i")
+    trade = _find_active_trade_by_order(symbol, oid)
+    if not trade:
+        return  # 不是我們追蹤的單（或已處理）
+    info = trade.get("oco_orders") or {}
+    pos = await _api(_client.futures_position_information, symbol=symbol)
+    amt = abs(float(pos[0]["positionAmt"])) if pos else 0.0
+    if amt == 0:
+        await _cancel_all_futures_orders(symbol)
+        trades.set_status(trade["id"], "CLOSED")
+        print(f"[trader] trade#{trade['id']} {symbol} 倉位已平 → CLOSED（WS 即時）")
+        return
+    if BREAKEVEN_AFTER_TP1:
+        await _update_dual_sl_futures(trade, info, amt)
 
 
 async def _monitor_loop() -> None:
@@ -798,39 +887,41 @@ async def _update_dual_sl_futures(trade: dict, info: dict, amt: float,
     if not info.get("tp_orders"):
         return
     symbol = trade["symbol"]
-    tier = await _tp_levels_realized(symbol, info, snap)
-    current = int(trade.get("sl_moved") or 0)
-    if tier < 1 or tier <= current:
-        return  # 還沒多成交 TP，或止損已在這個（含更高）階
+    async with _sl_update_lock:  # WS 即時事件與保險絲迴圈都可能進來，序列化避免重複撤/掛
+        tier = await _tp_levels_realized(symbol, info, snap)
+        # 鎖內重讀 sl_moved（以 DB 為準），避免兩個觸發源拿到過期值重複上移
+        current = int((trades.get(trade["id"]) or {}).get("sl_moved") or 0)
+        if tier < 1 or tier <= current:
+            return  # 還沒多成交 TP，或止損已在這個（含更高）階
 
-    filt = await _get_filters(symbol)
-    rungs = _sl_ladder(trade["signal"])
-    if tier + 1 >= len(rungs):
-        return
-    sl_hi = _quantize(rungs[tier + 1], filt["tick"])
-    sl_lo = _quantize(rungs[tier], filt["tick"])
+        filt = await _get_filters(symbol)
+        rungs = _sl_ladder(trade["signal"])
+        if tier + 1 >= len(rungs):
+            return
+        sl_hi = _quantize(rungs[tier + 1], filt["tick"])
+        sl_lo = _quantize(rungs[tier], filt["tick"])
 
-    if snap is not None:
-        price = snap["prices"].get(symbol, 0.0)
-    else:
-        ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
-        price = float(ticker["price"])
-    if price <= 0 or not _sl_safe_side(float(sl_hi), price):
-        return  # 上軌已不在市價安全側（設了會立刻觸發）→ 這輪先不動，下輪再試
+        if snap is not None:
+            price = snap["prices"].get(symbol, 0.0)
+        else:
+            ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
+            price = float(ticker["price"])
+        if price <= 0 or not _sl_safe_side(float(sl_hi), price):
+            return  # 上軌已不在市價安全側（設了會立刻觸發）→ 等下一次再試
 
-    # 撤掉舊的兩道止損（含相容舊版單張 sl_order_id）
-    for oid in (info.get("sl_orders") or []):
-        await _cancel_conditional(symbol, oid)
-    await _cancel_conditional(symbol, info.get("sl_order_id"))
+        # 撤掉舊的兩道止損（含相容舊版單張 sl_order_id）
+        for oid in (info.get("sl_orders") or []):
+            await _cancel_conditional(symbol, oid)
+        await _cancel_conditional(symbol, info.get("sl_order_id"))
 
-    sl_ids, sl_prices = await _place_dual_sls(symbol, float(sl_hi), float(sl_lo), amt, filt)
-    info["sl_orders"] = sl_ids
-    info["sl_prices"] = sl_prices
-    info.pop("sl_order_id", None)
-    info.pop("sl_price", None)
-    trades.update_oco(trade["id"], info, sl_moved=tier)
-    tail = f" / 下軌 {sl_prices[1]}" if len(sl_prices) > 1 else ""
-    print(f"[trader] trade#{trade['id']} {symbol} 已實現 TP{tier} → 止損上移：上軌 {sl_prices[0]}{tail}（各半倉）")
+        sl_ids, sl_prices = await _place_dual_sls(symbol, float(sl_hi), float(sl_lo), amt, filt)
+        info["sl_orders"] = sl_ids
+        info["sl_prices"] = sl_prices
+        info.pop("sl_order_id", None)
+        info.pop("sl_price", None)
+        trades.update_oco(trade["id"], info, sl_moved=tier)
+        tail = f" / 下軌 {sl_prices[1]}" if len(sl_prices) > 1 else ""
+        print(f"[trader] trade#{trade['id']} {symbol} 已實現 TP{tier} → 止損上移：上軌 {sl_prices[0]}{tail}（各半倉）")
 
 
 async def _cancel_all_futures_orders(symbol: str) -> None:
