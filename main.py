@@ -396,12 +396,17 @@ def _v_max_open(v: float) -> str | None:
     return None if v >= 1 else "至少要 1"
 
 
+def _v_nonneg(v: float) -> str | None:
+    return None if v >= 0 else "不能小於 0"
+
+
 # 可由 Bot 即時調整的交易參數：
 #   bot_key -> (binance_trader 模組屬性, .env 鍵名, 轉型函式, 範圍檢查)
 TUNABLE_PARAMS = {
-    "leverage":        ("LEVERAGE",        "LEVERAGE",        int,   _v_leverage),
-    "min_amount_mult": ("MIN_AMOUNT_MULT", "MIN_AMOUNT_MULT", float, _v_positive),
-    "max_open_trades": ("MAX_OPEN_TRADES", "MAX_OPEN_TRADES", int,   _v_max_open),
+    "leverage":          ("LEVERAGE",          "LEVERAGE",          int,   _v_leverage),
+    "min_amount_mult":   ("MIN_AMOUNT_MULT",   "MIN_AMOUNT_MULT",   float, _v_positive),
+    "max_open_trades":   ("MAX_OPEN_TRADES",   "MAX_OPEN_TRADES",   int,   _v_max_open),
+    "entry_timeout_min": ("ENTRY_TIMEOUT_MIN", "ENTRY_TIMEOUT_MIN", float, _v_nonneg),
 }
 
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -440,6 +445,7 @@ PARAM_HELP = {
     "leverage": "槓桿倍數，整數 1~125。每筆進場前套用。",
     "min_amount_mult": "最小金額倍數，>0 的數。最小可下量 × 此倍數 = 投入保證金本金。",
     "max_open_trades": "最大同時持倉筆數，整數 ≥1。",
+    "entry_timeout_min": "進場掛單幾分鐘未成交就撤單，數字 ≥0；0 = 永不超時、一直等成交。",
 }
 
 # admin sender_id -> 進行中的互動：("param", 參數key) 或 ("cmd", 指令名)

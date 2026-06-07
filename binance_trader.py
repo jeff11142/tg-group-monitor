@@ -52,7 +52,6 @@ BREAKEVEN_FEE_PCT = float(_get("BREAKEVEN_FEE_PCT", "0.1"))
 SL_MULTIPLIER = float(_get("SL_MULTIPLIER", "2"))
 # 限價買單超過幾分鐘未成交就撤單、釋放持倉額度（0=永不超時，一直等成交）
 ENTRY_TIMEOUT_MIN = float(_get("ENTRY_TIMEOUT_MIN", "30"))
-ENTRY_TIMEOUT_SEC = ENTRY_TIMEOUT_MIN * 60
 # 合約模式（USDT-M 永續）：1=合約 0=現貨
 FUTURES = _get("BINANCE_FUTURES", "0") == "1"
 LEVERAGE = int(_get("LEVERAGE", "1"))
@@ -283,7 +282,9 @@ async def _watch_and_protect(tid: int, initial_status: str = "") -> None:
         order_id = trade["buy_order_id"]
 
         if initial_status != "FILLED":
-            deadline = time.monotonic() + ENTRY_TIMEOUT_SEC if ENTRY_TIMEOUT_SEC > 0 else None
+            # 進場掛單存活秒數（即時讀 ENTRY_TIMEOUT_MIN，Bot 改了下一筆就生效）；0=永不超時
+            timeout_sec = ENTRY_TIMEOUT_MIN * 60
+            deadline = time.monotonic() + timeout_sec if timeout_sec > 0 else None
             # 剛下單時 testnet 可能因複寫延遲回 -2013（其實單子在），容忍重試
             not_found = 0
             await asyncio.sleep(1.0)
