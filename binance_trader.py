@@ -48,6 +48,9 @@ BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
 BREAKEVEN_FEE_PCT = float(_get("BREAKEVEN_FEE_PCT", "0.1"))
 # 階梯追蹤止損：TP2 成交後把止損推到 TP1 價、TP3 後推到 TP2 價…逐段鎖利（合約）。0=只在 TP1 做一次保本
 TRAILING_SL = _get("TRAILING_SL", "1") == "1"
+# 下單止損倍數：實際掛的止損 = 進場 + 此倍數 ×（訊號止損1 − 進場），把止損1 距離放大這麼多倍
+# （例：訊號 SL1 是 -5%，倍數 2 → 實際掛在 -10%）。轉發訊息仍用訊號原始止損，不受此影響。
+SL_MULTIPLIER = float(_get("SL_MULTIPLIER", "2"))
 # 限價買單超過幾分鐘未成交就撤單、釋放持倉額度（0=永不超時，一直等成交）
 ENTRY_TIMEOUT_MIN = float(_get("ENTRY_TIMEOUT_MIN", "30"))
 ENTRY_TIMEOUT_SEC = ENTRY_TIMEOUT_MIN * 60
@@ -67,6 +70,14 @@ def _sides() -> tuple[str, str]:
     if TRADE_SIDE == "SHORT":
         return "SELL", "BUY"
     return "BUY", "SELL"
+
+
+def _effective_stop(signal: dict) -> float:
+    """實際下單用的止損價：把訊號止損1 相對進場的距離放大 SL_MULTIPLIER 倍。
+    = 進場 + 倍數 ×（訊號止損1 − 進場）。轉發訊息仍用訊號原始止損，不走這裡。"""
+    entry = float(signal["entry"])
+    sl1 = float(signal["stops"][0]["price"])
+    return entry + SL_MULTIPLIER * (sl1 - entry)
 
 _client: Client | None = None
 _filters_cache: dict = {}
@@ -394,7 +405,7 @@ async def _place_protection_futures(trade: dict) -> bool:
     filt = await _get_filters(symbol)
     targets = signal["targets"]
     _, close_side = _sides()
-    sl1 = _quantize(signal["stops"][0]["price"], filt["tick"])
+    sl1 = _quantize(_effective_stop(signal), filt["tick"])
 
     # 先確認真的有持倉才掛保護（重啟回復/延遲時，倉位可能已被平掉或從未開成）
     pos = await _api(_client.futures_position_information, symbol=symbol)
@@ -466,7 +477,7 @@ async def _place_oco_grid(trade: dict) -> None:
     signal = trade["signal"]
     filt = await _get_filters(symbol)
     targets = signal["targets"]
-    sl1 = signal["stops"][0]["price"]
+    sl1 = _effective_stop(signal)
     sl_trigger = _quantize(sl1, filt["tick"])
     # 止損腿是 stop-limit，限價設得比觸發價低一點，確保急殺時掛得掉
     sl_limit = _quantize(sl1 * (1 - SL_LIMIT_BUFFER_PCT / 100), filt["tick"])

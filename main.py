@@ -145,34 +145,6 @@ def parse_signal(text: str) -> dict | None:
     return signal
 
 
-# 止損2 重算倍數：捨棄訊號原本的止損2，改用「止損1 跌幅 × 此倍數」的價位
-SL2_MULTIPLIER = float(_get("SL2_MULTIPLIER", "2"))
-
-
-def _decimals(x: float) -> int:
-    """估算一個價格的小數位數，讓重算的止損2 顯示精度與原價一致。"""
-    s = repr(float(x))
-    if "e" in s or "E" in s:
-        return 8
-    return len(s.split(".")[1]) if "." in s else 0
-
-
-def override_sl2(signal: dict) -> dict:
-    """捨棄訊號原本的止損2，改用「止損1 相對進場的跌幅 × SL2_MULTIPLIER」重算的價位。
-    數學上 = 進場 + 倍數 ×（止損1 − 進場）。保留止損1；不足 1 個止損則原樣不動。"""
-    stops = signal.get("stops") or []
-    if not stops:
-        return signal
-    entry = signal["entry"]
-    sl1 = {**stops[0], "level": 1}
-    sl2_price = round(entry + SL2_MULTIPLIER * (sl1["price"] - entry),
-                      max(_decimals(entry), _decimals(sl1["price"])))
-    sl2 = {"level": 2, "price": sl2_price,
-           "pct": round((sl2_price - entry) / entry * 100, 2)}
-    signal["stops"] = [sl1, sl2]
-    return signal
-
-
 def format_signal(signal: dict, when: datetime) -> str:
     """把結構化訊號格式化成自訂版面。"""
     lines = [
@@ -915,8 +887,6 @@ async def main() -> None:
 
         now_local = datetime.now(timezone.utc).astimezone()
         signal = parse_signal(text)
-        if signal:
-            override_sl2(signal)  # 捨棄訊號原本的止損2，改用止損1 跌幅 ×SL2_MULTIPLIER 重算
         target_hit = None if signal else parse_target_hit(text)
         stop_hit = None if (signal or target_hit) else parse_stop_hit(text)
         if signal:
