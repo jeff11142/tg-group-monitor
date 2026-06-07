@@ -1,11 +1,12 @@
-"""幣安自動化交易：依訊號限價進場，成交後掛多段止盈 + SL1 全清止損。
+"""幣安自動化交易：依訊號限價進場，成交後掛多段止盈 + 雙軌半倉止損。
 
 用 BINANCE_FUTURES 切換現貨／合約：
 - 現貨（只做多）：倉位拆成數份，每份一張 OCO（止盈腿在各目標價、止損腿都在 SL1）。
-- 合約（USDT-M，目前做多，預留做空）：N 張 reduce-only 止盈 + 1 張 STOP_MARKET
-  closePosition 止損，碰 SL1 直接把整個倉位平掉。槓桿/保證金模式由 LEVERAGE/MARGIN_TYPE 設定。
+- 合約（USDT-M，目前做多，預留做空）：N 張 reduce-only 止盈（30/30/20/20）＋ 兩張
+  reduce-only 半倉止損（上軌 SL1、下軌 SL2）。每段 TP 成交後撤掉兩道止損、在階梯新階重掛
+  （各取當下剩餘半倉），達成逐段鎖利。槓桿/保證金模式由 LEVERAGE/MARGIN_TYPE 設定。
 
-策略（靜態）：進場時就把止盈/止損一次掛好；之後交易所自己執行，程式只負責對帳收單與保本。
+策略：進場一次掛好止盈與雙軌止損；對帳迴圈負責收單、保險絲兜底、與雙軌止損逐段上移。
 
 ⚠️ 預設連 testnet（假錢）。合約 testnet 與現貨 testnet 是不同網站、不同金鑰。
    現貨：testnet.binance.vision；合約：testnet.binancefuture.com
@@ -46,8 +47,6 @@ MONITOR_INTERVAL = float(_get("TRADE_MONITOR_INTERVAL", "15"))
 BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
 # 淨保本：移到保本時把止損設在「進場價 ×（1 ± 此手續費%）」，涵蓋來回手續費，移動後即使被掃也不虧
 BREAKEVEN_FEE_PCT = float(_get("BREAKEVEN_FEE_PCT", "0.1"))
-# 階梯追蹤止損：TP2 成交後把止損推到 TP1 價、TP3 後推到 TP2 價…逐段鎖利（合約）。0=只在 TP1 做一次保本
-TRAILING_SL = _get("TRAILING_SL", "1") == "1"
 # 下單止損倍數：實際掛的止損 = 進場 + 此倍數 ×（訊號止損1 − 進場），把止損1 距離放大這麼多倍
 # （例：訊號 SL1 是 -5%，倍數 2 → 實際掛在 -10%）。轉發訊息仍用訊號原始止損，不受此影響。
 SL_MULTIPLIER = float(_get("SL_MULTIPLIER", "2"))
@@ -226,7 +225,7 @@ async def _on_signal(signal: dict) -> None:
             return
 
         # 預檢：現貨每張 OCO 都是真實賣單，分批後最小一份也要滿足最小金額。
-        # 合約的止盈是 reduce-only、止損是 closePosition（平倉單），幣安不做此檢查，故略過。
+        # 合約的止盈/止損都是 reduce-only 市價條件單，幣安不做此最小名目檢查，故略過。
         if not FUTURES:
             smallest = Decimal(str(min(TP_RATIOS))) / Decimal(str(sum(TP_RATIOS)))
             if qty * price * smallest < filt["min_notional"]:
@@ -399,39 +398,26 @@ async def _market_close_qty(symbol: str, close_side: str, qty: Decimal) -> None:
 
 
 async def _place_protection_futures(trade: dict) -> bool:
-    """合約：先掛止損，再掛 N 段止盈。進場時已穿過的價位改用市價即時處理。"""
+    """合約：掛雙軌半倉止損（SL1 上軌 / SL2 下軌）＋ N 段止盈（30/30/20/20）。"""
     symbol = trade["symbol"]
     signal = trade["signal"]
     filt = await _get_filters(symbol)
     targets = signal["targets"]
     _, close_side = _sides()
-    sl1 = _quantize(_effective_stop(signal), filt["tick"])
 
     # 先確認真的有持倉才掛保護（重啟回復/延遲時，倉位可能已被平掉或從未開成）
     pos = await _api(_client.futures_position_information, symbol=symbol)
-    if not pos or abs(float(pos[0]["positionAmt"])) == 0:
+    amt = abs(float(pos[0]["positionAmt"])) if pos else 0.0
+    if amt == 0:
         print(f"[trader] {symbol} 無持倉可保護（可能已平倉），trade#{trade['id']} → CLOSED")
         trades.set_status(trade["id"], "CLOSED")
         return False
 
-    # 先掛止損。-2021=已穿過止損→直接全平；其他錯誤→不中斷，靠對帳保險絲兜底
-    sl_order_id = None
-    try:
-        sl_resp = await _api(
-            _client.futures_create_order, symbol=symbol, side=close_side,
-            type="STOP_MARKET", stopPrice=format(sl1, "f"), closePosition="true",
-        )
-        sl_order_id = _oid(sl_resp)
-        print(f"[trader]   SL: {close_side} 全平 @ {sl1}（closePosition）")
-    except BinanceAPIException as e:
-        if e.code == -2021:  # Order would immediately trigger（已穿過止損）
-            print(f"[trader] ⚠️ {symbol} 進場時價格已穿過止損 {sl1} → 直接市價全平")
-            await _force_close_now(trade, close_side, filt)
-            return False
-        # 其他原因掛不上（如交易所暫時拒 closePosition）→ 不中斷，sl_price 仍會存，由保險絲兜底
-        print(f"[trader] ⚠️ {symbol} 止損單掛單失敗（{e.message}）→ 改由對帳保險絲兜底（SL_FAILSAFE）")
+    # 雙軌止損：初始（tier 0）→ 上軌 rung[1]（訊號SL1×倍數）、下軌 rung[0]（訊號SL2），各取半倉
+    rungs = _sl_ladder(signal)
+    sl_ids, sl_prices = await _place_dual_sls(symbol, rungs[1], rungs[0], amt, filt)
 
-    # 再掛 N 段止盈；某段若進場時已達 → 市價賣掉那段（直接落袋）
+    # N 段止盈；某段若進場時已達 → 市價賣掉那段（直接落袋）
     n = min(len(TP_RATIOS), len(targets))
     portions = _split_portions(Decimal(str(trade["qty"])), n, filt["step"])
     tp_orders = []
@@ -455,21 +441,9 @@ async def _place_protection_futures(trade: dict) -> bool:
             print(f"[trader] ⚠️ {symbol} TP{i + 1} {tp_price} 進場時已達 → 市價賣出該段 {qty_i}")
             await _market_close_qty(symbol, close_side, qty_i)
 
-    trades.set_oco(trade["id"], {"mode": "futures", "sl_order_id": sl_order_id,
-                                 "sl_price": float(sl1), "tp_orders": tp_orders})
+    trades.set_oco(trade["id"], {"mode": "futures", "sl_orders": sl_ids,
+                                 "sl_prices": sl_prices, "tp_orders": tp_orders})
     return True
-
-
-async def _force_close_now(trade: dict, close_side: str, filt: dict) -> None:
-    """市價平掉整個倉位、撤殘留單、標記 CLOSED（進場即穿止損時用）。"""
-    symbol = trade["symbol"]
-    pos = await _api(_client.futures_position_information, symbol=symbol)
-    amt = abs(float(pos[0]["positionAmt"])) if pos else 0.0
-    if amt > 0:
-        await _market_close_qty(symbol, close_side, _quantize(amt, filt["step"]))
-    await _cancel_all_futures_orders(symbol)
-    trades.set_status(trade["id"], "CLOSED")
-    print(f"[trader] trade#{trade['id']} {symbol} 已市價平倉 → CLOSED")
 
 
 async def _place_oco_grid(trade: dict) -> None:
@@ -542,10 +516,7 @@ async def resume() -> None:
 def start_monitor() -> None:
     """啟動背景對帳迴圈：自動收單（#1）+ TP1 後移動停損到保本（#2）。"""
     _spawn(_monitor_loop())
-    if BREAKEVEN_AFTER_TP1:
-        sl_desc = "，TP1 後逐段追蹤止損（鎖利）" if TRAILING_SL else "，TP1 後移動止損到淨保本"
-    else:
-        sl_desc = ""
+    sl_desc = "，雙軌半倉止損逐段上移（階梯鎖利）" if BREAKEVEN_AFTER_TP1 else ""
     print(f"[trader] 對帳迴圈啟動（每 {MONITOR_INTERVAL:g} 秒）{sl_desc}")
 
 
@@ -580,27 +551,29 @@ async def _reconcile_futures(trade: dict) -> None:
         print(f"[trader] trade#{trade['id']} {symbol} 倉位已平 → CLOSED（釋放持倉額度）")
         return
 
-    # 取一次現價供保險絲判斷
-    sl_price = info.get("sl_price")
-    need_price = (SL_FAILSAFE and sl_price) or (TP_FAILSAFE and info.get("tp_orders"))
+    # 取一次現價供保險絲判斷。相容舊版單張 sl_price
+    sl_prices = info.get("sl_prices") or ([info["sl_price"]] if info.get("sl_price") else [])
+    need_price = (SL_FAILSAFE and sl_prices) or (TP_FAILSAFE and info.get("tp_orders"))
     price = 0.0
     if need_price:
         ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
         price = float(ticker.get("price") or 0)
 
-    # 止損保險絲：價格穿過止損價但倉位還在 → 主動市價「全平」兜底
-    if SL_FAILSAFE and sl_price and price > 0 and _stop_breached(price, float(sl_price)):
-        await _force_close_futures(trade, amt, price, float(sl_price))
-        return
+    # 止損保險絲：價格穿過「最深的那道止損」但倉位還在 → 主動市價「全平」兜底
+    if SL_FAILSAFE and sl_prices and price > 0:
+        deepest = max(sl_prices) if TRADE_SIDE == "SHORT" else min(sl_prices)
+        if _stop_breached(price, deepest):
+            await _force_close_futures(trade, amt, price, deepest)
+            return
 
     # 止盈保險絲：價格穿過某段止盈但該段條件單還掛著沒成交 → 市價「逐段補平」
     if TP_FAILSAFE and price > 0 and info.get("tp_orders"):
         if await _tp_failsafe_futures(trade, info, price):
-            return  # 有補平就這輪先收尾，下輪再判斷移保本/收單
+            return  # 有補平就這輪先收尾，下輪再判斷止損上移/收單
 
-    # #2 動態止損：依已成交的止盈段數逐段上移止損（TP1→淨保本、TP2→TP1價、TP3→TP2價…）
+    # #2 雙軌動態止損：每段 TP 成交後，撤兩道止損、在階梯新階重掛（各取剩餘半倉）
     if BREAKEVEN_AFTER_TP1:
-        await _update_trailing_sl_futures(trade, info, amt)
+        await _update_dual_sl_futures(trade, info, amt)
 
 
 def _tp_breached(price: float, tp_price: float) -> bool:
@@ -690,66 +663,103 @@ async def _cancel_conditional(symbol: str, order_id) -> None:
             print(f"[trader] 撤條件單 {order_id} 失敗（忽略續行）：{e.code} {e.message}")
 
 
-async def _replace_sl_futures(trade: dict, info: dict, stop_price: Decimal, filt: dict) -> None:
-    """撤掉舊的 closePosition 止損，在 stop_price 重掛一張新的，更新 info。"""
-    symbol = trade["symbol"]
+def _sl_ladder(signal: dict) -> list[float]:
+    """止損階梯（低→高）：[訊號SL2, 訊號SL1×SL_MULTIPLIER, 淨保本, TP1, TP2…]。
+    雙軌取相鄰兩階：上軌=rung[tier+1]、下軌=rung[tier]（tier=已成交TP數）。"""
+    entry = float(signal["entry"])
+    stops = signal.get("stops") or []
+    s1 = _effective_stop(signal)                                   # 訊號SL1 × 倍數
+    rungs = [float(stops[1]["price"]) if len(stops) > 1 else s1]   # 訊號SL2（最底；缺則退用 s1）
+    rungs.append(s1)
+    rungs.append(float(_net_breakeven_price(Decimal(str(entry))))) # 淨保本
+    rungs.extend(float(t["price"]) for t in signal["targets"])     # TP1..TPn
+    return rungs
+
+
+async def _place_dual_sls(symbol: str, sl_hi: float, sl_lo: float,
+                          remaining: float, filt: dict) -> tuple[list, list]:
+    """掛雙軌 reduceOnly 半倉止損（上軌 sl_hi、下軌 sl_lo），各取剩餘倉位的一半。
+    回傳 (order_ids, prices)。某段已穿價(-2021)就市價平該段；倉位太小無法對半→單張守全部剩餘。"""
     _, close_side = _sides()
-    await _cancel_conditional(symbol, info.get("sl_order_id"))
-    resp = await _api(_client.futures_create_order, symbol=symbol, side=close_side,
-                      type="STOP_MARKET", stopPrice=format(stop_price, "f"), closePosition="true")
-    info["sl_order_id"] = _oid(resp)
-    info["sl_price"] = float(stop_price)
+    min_qty = float(filt["min_qty"])
+    hi = _quantize(sl_hi, filt["tick"])
+    lo = _quantize(sl_lo, filt["tick"])
+    half = _quantize(remaining / 2, filt["step"])
+    rest = _quantize(remaining - float(half), filt["step"])
+    if float(half) < min_qty or float(rest) < min_qty:
+        legs = [(hi, _quantize(remaining, filt["step"]))]   # 太小→單張守全部剩餘，掛較保守的上軌
+    else:
+        legs = [(hi, half), (lo, rest)]
+
+    ids, prices = [], []
+    for price, qty in legs:
+        if float(qty) <= 0:
+            continue
+        try:
+            resp = await _api(_client.futures_create_order, symbol=symbol, side=close_side,
+                              type="STOP_MARKET", stopPrice=format(price, "f"),
+                              quantity=format(qty, "f"), reduceOnly="true")
+            ids.append(_oid(resp))
+            prices.append(float(price))
+            print(f"[trader]   SL: {close_side} {qty} @ {price}（reduceOnly 半倉）")
+        except BinanceAPIException as e:
+            if e.code != -2021:
+                raise
+            print(f"[trader] ⚠️ {symbol} 止損 {price} 進場時已穿價 → 市價平 {qty}")
+            await _market_close_qty(symbol, close_side, qty)
+    return ids, prices
 
 
-def _tp_levels_realized(trade: dict, info: dict, amt: float) -> int:
-    """依倉位已減少的量，回推已實現到第幾段止盈（止盈按序成交）。"""
-    tp_orders = sorted(info.get("tp_orders") or [], key=lambda t: t["level"])
-    filled_qty = float(trade["qty"]) - amt
-    tol = float(trade["qty"]) * 0.001
-    tier, cum = 0, 0.0
-    for t in tp_orders:
-        cum += float(t["qty"])
-        if filled_qty >= cum - tol:
-            tier = t["level"]
+async def _tp_levels_realized(symbol: str, info: dict) -> int:
+    """用「TP 掛單是否還在」判定已成交到第幾段（止盈按序成交）。
+    以掛單為準，不用倉位減少量，避免止損先觸發造成倉位變少被誤判成 TP 成交。"""
+    cond = await _api(_client.futures_get_open_orders, symbol=symbol, conditional=True)
+    open_ids = {(o.get("orderId") or o.get("algoId")) for o in cond}
+    tier = 0
+    for t in sorted(info.get("tp_orders") or [], key=lambda x: x["level"]):
+        if t["order_id"] not in open_ids:
+            tier = t["level"]   # 此段 TP 已不在掛單 = 已實現
         else:
             break
     return tier
 
 
-async def _update_trailing_sl_futures(trade: dict, info: dict, amt: float) -> None:
-    """合約動態止損：第 1 段止盈成交→止損移到淨保本；第 k 段(k≥2)成交→止損推到第 (k-1) 段止盈價。
-    沒開 TRAILING_SL 時只在第 1 段做一次保本。"""
-    tp_orders = info.get("tp_orders") or []
-    if not tp_orders:
+async def _update_dual_sl_futures(trade: dict, info: dict, amt: float) -> None:
+    """雙軌動態止損：每多成交一段 TP，撤掉兩道舊止損，在階梯新一階重掛、各取當下剩餘的一半。
+    上軌=rung[tier+1]、下軌=rung[tier]（rung=[訊號SL2, 訊號SL1×倍數, 淨保本, TP1, TP2…]）。"""
+    if not info.get("tp_orders"):
         return
-    tier = _tp_levels_realized(trade, info, amt)
-    target_tier = tier if TRAILING_SL else min(tier, 1)
-    current = int(trade.get("sl_moved") or 0)
-    if target_tier < 1 or target_tier <= current:
-        return  # 還沒有止盈成交，或止損已在這個（含更高）層級
-
     symbol = trade["symbol"]
+    tier = await _tp_levels_realized(symbol, info)
+    current = int(trade.get("sl_moved") or 0)
+    if tier < 1 or tier <= current:
+        return  # 還沒多成交 TP，或止損已在這個（含更高）階
+
     filt = await _get_filters(symbol)
-    entry = Decimal(str(trade["entry"]))
-    if target_tier == 1:
-        target = _net_breakeven_price(entry)
-        label = f"淨保本（含 {BREAKEVEN_FEE_PCT}% 手續費）"
-    else:
-        prev = next((t for t in tp_orders if t["level"] == target_tier - 1), None)
-        if not prev:
-            return
-        target = Decimal(str(prev["tp"]))
-        label = f"鎖利至 TP{target_tier - 1} 價"
-    be = _quantize(float(target), filt["tick"])
+    rungs = _sl_ladder(trade["signal"])
+    if tier + 1 >= len(rungs):
+        return
+    sl_hi = _quantize(rungs[tier + 1], filt["tick"])
+    sl_lo = _quantize(rungs[tier], filt["tick"])
 
     ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
     price = float(ticker["price"])
-    if not _sl_safe_side(float(be), price):
-        return  # 市價已不在安全側（設了會立刻觸發）→ 這次先不動，維持原止損，下輪再試
+    if not _sl_safe_side(float(sl_hi), price):
+        return  # 上軌已不在市價安全側（設了會立刻觸發）→ 這輪先不動，下輪再試
 
-    await _replace_sl_futures(trade, info, be, filt)
-    trades.update_oco(trade["id"], info, sl_moved=target_tier)
-    print(f"[trader] trade#{trade['id']} {symbol} 已實現 TP{tier}，止損上移 → {label} {be}")
+    # 撤掉舊的兩道止損（含相容舊版單張 sl_order_id）
+    for oid in (info.get("sl_orders") or []):
+        await _cancel_conditional(symbol, oid)
+    await _cancel_conditional(symbol, info.get("sl_order_id"))
+
+    sl_ids, sl_prices = await _place_dual_sls(symbol, float(sl_hi), float(sl_lo), amt, filt)
+    info["sl_orders"] = sl_ids
+    info["sl_prices"] = sl_prices
+    info.pop("sl_order_id", None)
+    info.pop("sl_price", None)
+    trades.update_oco(trade["id"], info, sl_moved=tier)
+    tail = f" / 下軌 {sl_prices[1]}" if len(sl_prices) > 1 else ""
+    print(f"[trader] trade#{trade['id']} {symbol} 已實現 TP{tier} → 止損上移：上軌 {sl_prices[0]}{tail}（各半倉）")
 
 
 async def _cancel_all_futures_orders(symbol: str) -> None:
