@@ -31,6 +31,8 @@ TESTNET = _get("BINANCE_TESTNET", "1") == "1"
 API_KEY = _get("BINANCE_API_KEY")
 API_SECRET = _get("BINANCE_API_SECRET")
 TRADE_USDT = float(_get("TRADE_USDT", "50"))
+# 合約固定本金（USDT）：>0 時用「名目 = 本金 × 槓桿」算倉位（保證金一致優先）。0=沿用舊邏輯。
+MARGIN_USDT = float(_get("MARGIN_USDT", "0"))
 # 自動最小金額：1=每筆依交易對自動算出「能成功下單＋拆得出分批」的最小金額並用它下單
 AUTO_MIN_AMOUNT = _get("AUTO_MIN_AMOUNT", "0") == "1"
 # 自動最小金額模式：先把幣安最小可下量乘上這個倍數當「投入保證金本金」，再乘槓桿成下單名目。
@@ -47,8 +49,12 @@ MONITOR_INTERVAL = float(_get("TRADE_MONITOR_INTERVAL", "15"))
 BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
 # 淨保本：移到保本時把止損設在「進場價 ×（1 ± 此手續費%）」，涵蓋來回手續費，移動後即使被掃也不虧
 BREAKEVEN_FEE_PCT = float(_get("BREAKEVEN_FEE_PCT", "0.1"))
-# 下單止損倍數：實際掛的止損 = 進場 + 此倍數 ×（訊號止損1 − 進場），把止損1 距離放大這麼多倍
-# （例：訊號 SL1 是 -5%，倍數 2 → 實際掛在 -10%）。轉發訊息仍用訊號原始止損，不受此影響。
+# 合約固定止損百分比（不看訊號 SL）：SL1=淺軌、SL2=深軌，做多往下、做空往上。
+# 雙軌初始＝（上軌 -SL1_PCT%、下軌 -SL2_PCT%）；每中一段 TP 整組往上爬一階（保本→TP1→…）。
+SL1_PCT = float(_get("SL1_PCT", "5"))
+SL2_PCT = float(_get("SL2_PCT", "10"))
+# 下單止損倍數：僅「現貨」OCO 仍沿用（合約已改用上方固定 SL1_PCT/SL2_PCT）。
+# 實際掛的止損 = 進場 + 此倍數 ×（訊號止損1 − 進場）。轉發訊息仍用訊號原始止損，不受此影響。
 SL_MULTIPLIER = float(_get("SL_MULTIPLIER", "2"))
 # 限價買單超過幾分鐘未成交就撤單、釋放持倉額度（0=永不超時，一直等成交）
 ENTRY_TIMEOUT_MIN = float(_get("ENTRY_TIMEOUT_MIN", "30"))
@@ -216,6 +222,11 @@ async def _on_signal(signal: dict) -> None:
             print(f"[trader] {symbol} 自動最小金額：{base:.2f} × {MIN_AMOUNT_MULT:g}"
                   f" = 保證金 {margin:.2f} USDT × {LEVERAGE}x → 名目 {amount:.2f} USDT"
                   f"（minNotional={filt['min_notional']}, minQty={filt['min_qty']}）")
+        elif FUTURES and MARGIN_USDT > 0:
+            # 保證金一致優先：名目 = 固定本金 × 槓桿，每筆佔用保證金固定 = MARGIN_USDT
+            amount = MARGIN_USDT * LEVERAGE
+            print(f"[trader] {symbol} 固定本金 {MARGIN_USDT:g} USDT × {LEVERAGE}x"
+                  f" → 名目 {amount:.2f} USDT")
         else:
             amount = TRADE_USDT
         qty = _quantize(amount / float(price), filt["step"])
@@ -364,19 +375,35 @@ async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dic
     return False
 
 
-def _split_portions(qty_total: Decimal, n: int, step: str) -> list[Decimal]:
-    """把總量按 TP_RATIOS 拆成 n 份，最後一份吃剩餘避免 dust。"""
-    ratios = TP_RATIOS[:n]
-    total = Decimal(str(sum(ratios)))
+def _adaptive_portions(qty_total: Decimal, step: str, min_qty,
+                       n_targets: int) -> list[Decimal]:
+    """保證金一致優先：依倉位大小自動決定止盈段數。
+
+    拆得出幾段就掛幾段，對應「最近的 N 個目標」（portions[0]=TP1）；倉位太小時自動降級
+    （最少 1 段＝全押 TP1）。每段都保證 ≥ minQty，零頭補到最近端（TP1）避免 dust。
+    """
     step_d = Decimal(str(step))
-    portions, allocated = [], Decimal("0")
-    for i in range(n):
-        if i < n - 1:
-            q = _quantize(float(qty_total * Decimal(str(ratios[i])) / total), step)
-        else:
-            q = ((qty_total - allocated) // step_d) * step_d
+    min_q = Decimal(str(min_qty))
+    desired = max(min(len(TP_RATIOS), n_targets), 1)
+    # 由多到少試出可行段數 k：用前 k 個比例，最小一份取整後仍 ≥ minQty 才成立
+    k = desired
+    while k > 1:
+        ratios_k = TP_RATIOS[:k]
+        smallest = _quantize(
+            float(qty_total * Decimal(str(min(ratios_k))) / Decimal(str(sum(ratios_k)))), step)
+        if smallest >= min_q:
+            break
+        k -= 1
+    # 遠端各取比例（往下取整），最近端 TP1 吃剩餘吸收零頭
+    ratios_k = TP_RATIOS[:k]
+    total = Decimal(str(sum(ratios_k)))
+    portions = [Decimal("0")] * k
+    allocated = Decimal("0")
+    for i in range(k - 1, 0, -1):
+        q = _quantize(float(qty_total * Decimal(str(ratios_k[i])) / total), step)
+        portions[i] = q
         allocated += q
-        portions.append(q)
+    portions[0] = ((qty_total - allocated) // step_d) * step_d
     return portions
 
 
@@ -418,12 +445,12 @@ async def _place_protection_futures(trade: dict) -> bool:
     rungs = _sl_ladder(signal)
     sl_ids, sl_prices = await _place_dual_sls(symbol, rungs[1], rungs[0], amt, filt)
 
-    # N 段止盈；某段若進場時已達 → 市價賣掉那段（直接落袋）
-    n = min(len(TP_RATIOS), len(targets))
-    portions = _split_portions(Decimal(str(trade["qty"])), n, filt["step"])
+    # 止盈：依倉位大小自動決定段數（保證金一致優先），對應最近的 N 個目標。
+    # 某段若進場時已達 → 市價賣掉那段（直接落袋）。
+    portions = _adaptive_portions(Decimal(str(trade["qty"])), filt["step"],
+                                  filt["min_qty"], len(targets))
     tp_orders = []
-    for i in range(n):
-        qty_i = portions[i]
+    for i, qty_i in enumerate(portions):
         if qty_i <= 0:
             continue
         tp_price = _quantize(targets[i]["price"], filt["tick"])
@@ -665,15 +692,18 @@ async def _cancel_conditional(symbol: str, order_id) -> None:
 
 
 def _sl_ladder(signal: dict) -> list[float]:
-    """止損階梯（低→高）：[訊號SL2, 訊號SL1×SL_MULTIPLIER, 淨保本, TP1, TP2…]。
-    雙軌取相鄰兩階：上軌=rung[tier+1]、下軌=rung[tier]（tier=已成交TP數）。"""
-    entry = float(signal["entry"])
-    stops = signal.get("stops") or []
-    s1 = _effective_stop(signal)                                   # 訊號SL1 × 倍數
-    rungs = [float(stops[1]["price"]) if len(stops) > 1 else s1]   # 訊號SL2（最底；缺則退用 s1）
-    rungs.append(s1)
-    rungs.append(float(_net_breakeven_price(Decimal(str(entry))))) # 淨保本
-    rungs.extend(float(t["price"]) for t in signal["targets"])     # TP1..TPn
+    """止損階梯（防守→鎖利）：[SL2, SL1, 淨保本, TP1, TP2…]。
+    SL1/SL2 用固定百分比（SL1_PCT/SL2_PCT），不再依訊號止損。做多往下、做空往上。
+    雙軌取相鄰兩階：下軌=rung[tier]、上軌=rung[tier+1]（tier=已成交TP數）。"""
+    entry = Decimal(str(signal["entry"]))
+    p1 = Decimal(str(SL1_PCT)) / 100
+    p2 = Decimal(str(SL2_PCT)) / 100
+    if TRADE_SIDE == "SHORT":
+        sl2, sl1 = entry * (1 + p2), entry * (1 + p1)             # 做空：止損在上方
+    else:
+        sl2, sl1 = entry * (1 - p2), entry * (1 - p1)             # 做多：止損在下方
+    rungs = [float(sl2), float(sl1), float(_net_breakeven_price(entry))]
+    rungs.extend(float(t["price"]) for t in signal["targets"])    # TP1..TPn
     return rungs
 
 

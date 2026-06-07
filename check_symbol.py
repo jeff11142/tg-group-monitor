@@ -57,8 +57,15 @@ def main() -> None:
         print(f"  價格步進 tickSize    : {f['tick']}")
         print(f"  最小名目金額 minNotional : {mn:g} USDT")
         if futures:
-            print(f"  → 合約 {bt.LEVERAGE}x：每筆名目 ≥ {mn:g} USDT"
-                  f"（1x 時 TRADE_USDT 至少 ≈ {mn:g}）")
+            notional = bt.MARGIN_USDT * bt.LEVERAGE if bt.MARGIN_USDT > 0 else 0
+            if notional:
+                ok = notional >= mn
+                verdict = "✅ 可下單" if ok else f"🔴 跳過（名目 {notional:g} < minNotional {mn:g}）"
+                print(f"  → 合約 固定本金 {bt.MARGIN_USDT:g} × {bt.LEVERAGE}x"
+                      f" = 名目 {notional:g} USDT → {verdict}")
+            else:
+                print(f"  → 合約 {bt.LEVERAGE}x：每筆名目 ≥ {mn:g} USDT"
+                      f"（1x 時 TRADE_USDT 至少 ≈ {mn:g}）")
         else:
             smallest = min(bt.TP_RATIOS) / sum(bt.TP_RATIOS)
             print(f"  → 現貨：拆 {bt.TP_RATIOS} 後最小一份要 ≥ {mn:g}，"

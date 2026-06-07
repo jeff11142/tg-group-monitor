@@ -121,11 +121,14 @@ def dry_run(signal: dict) -> None:
         amount = margin * bt.LEVERAGE
         amt_src = (f"自動最小金額（{base:.2f} × {bt.MIN_AMOUNT_MULT:g}"
                    f" = 保證金 {margin:.2f} × {bt.LEVERAGE}x）")
+    elif bt.FUTURES and bt.MARGIN_USDT > 0:
+        amount = bt.MARGIN_USDT * bt.LEVERAGE
+        amt_src = f"固定本金 {bt.MARGIN_USDT:g} × {bt.LEVERAGE}x"
     else:
         amount = bt.TRADE_USDT
         amt_src = "固定 TRADE_USDT"
     qty = bt._quantize(amount / float(entry), filt["step"])
-    portions = bt._split_portions(qty, n, filt["step"])
+    portions = bt._adaptive_portions(qty, filt["step"], filt["min_qty"], len(signal["targets"]))
     sl1 = bt._quantize(signal["stops"][0]["price"], filt["tick"])
     print(f"\n=== 下單計畫（dry-run，正式網{market}門檻）===")
     print(f"  交易對   : {symbol}")
@@ -133,12 +136,13 @@ def dry_run(signal: dict) -> None:
     print(f"  金額     : {amt_src} → {amount:.4g} USDT")
     print(f"  買進     : {qty}（名目 {float(qty) * float(entry):.2f} USDT）")
     print(f"  門檻     : minNotional={filt['min_notional']} minQty={filt['min_qty']} step={filt['step']}")
-    for i in range(n):
+    for i in range(len(portions)):
         t = signal["targets"][i]
         print(f"  TP{i + 1}: 賣 {portions[i]} @ {bt._quantize(t['price'], filt['tick'])}（{t['pct']:+}%）")
     print(f"  SL: 全平 @ {sl1}（{signal['stops'][0]['pct']:+}%）")
-    if any(p <= 0 for p in portions):
-        print("  ⚠️ 有分批為 0！開 AUTO_MIN_AMOUNT 或調高 TRADE_USDT")
+    if len(portions) < n:
+        print(f"  ⚠️ 倉位偏小，止盈自動降級為 {len(portions)} 段（原定 {n} 段）"
+              f"，最近端 TP1 優先")
 
 
 async def live_run(signal: dict, args: argparse.Namespace) -> None:
