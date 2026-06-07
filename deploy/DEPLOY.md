@@ -74,9 +74,40 @@ sudo systemctl stop tg-group-monitor      # 停止
 journalctl -u tg-group-monitor -n 100     # 看最近 100 行日誌
 ```
 
+## 更新程式碼：永遠是「兩部分」
+
+⚠️ **`.env` 被 .gitignore 擋住，`git pull` 不會帶設定**。所以每次更新都要分開做：
+
+```bash
+cd /opt/tg-group-monitor
+git pull                                   # ① 程式碼
+nano .env                                  # ② 設定（git 帶不過去，手改）
+sudo systemctl restart tg-group-monitor    # ③ 重啟生效
+journalctl -u tg-group-monitor -n 30       # 看啟動 log 確認設定有吃到
+```
+
+只做 ① 不做 ②，新功能常常不會生效（程式讀到的是 VPS 上的舊 `.env`）。
+
 ## 改了 .env 設定怎麼辦
 
 直接在 VPS 編輯 `/opt/tg-group-monitor/.env`，然後 `sudo systemctl restart tg-group-monitor` 即可。
+
+### 交易相關設定 key（合約自動下單）
+
+改交易行為時，要同步 VPS `.env` 的這幾個 key：
+
+| key | 說明 | 目前值 |
+|---|---|---|
+| `BINANCE_TESTNET` | 1=測試網假錢、0=正式網真錢（換 0 要同時換正式網金鑰）| — |
+| `LEVERAGE` | 槓桿倍數 | 5 |
+| `MARGIN_TYPE` | `ISOLATED` 逐倉（風險封頂用，勿改 CROSS）| ISOLATED |
+| `MAX_OPEN_TRADES` | 最多同時持倉筆數 | 30 |
+| `MARGIN_USDT` | **固定本金/筆**；名目 = 本金 × 槓桿 | 30 |
+| `AUTO_MIN_AMOUNT` | 必須 `0`；設 1 會走舊的保證金放大邏輯 | 0 |
+| `SL1_PCT` / `SL2_PCT` | 固定雙軌止損 %（淺軌 -5% / 深軌 -10%）| 5 / 10 |
+| `TP_RATIOS` | 分段止盈比例（自適應，倉位小會自動降級）| 30,30,20,20 |
+
+> 提醒：已開的舊倉位 SL/TP 已掛在交易所上，改設定只影響「重啟後進來的新訊號」。
 
 ## 安全提醒
 
