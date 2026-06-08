@@ -553,6 +553,10 @@ async def _send_config_panel(event) -> None:
     for key, (attr, _, _, _) in TUNABLE_PARAMS.items():
         lines.append(f"  {key} = {_fmt_val(getattr(bt, attr))}")
         buttons.append([Button.inline(f"✏️ 改 {key}", f"setparam:{key}".encode())])
+    sl2_on = bt.SL2_MULT > 0
+    sl2_desc = f"開（SL2 = SL1 × {_fmt_val(bt.SL2_MULT)}）" if sl2_on else "關（單一止損守全倉）"
+    lines.append(f"  二段止損(SL2) = {sl2_desc}")
+    buttons.append([Button.inline(f"🛑 二段止損：點此{'關閉' if sl2_on else '開啟'}", b"sl2tog")])
     auto = "開" if bt.AUTO_MIN_AMOUNT else "關"
     lines.append(f"（環境：{bt.current_network()}｜自動最小金額：{auto}）")
     target = "正式網（真錢）" if bt.TESTNET else "測試網"
@@ -905,6 +909,25 @@ async def main() -> None:
                 msg += "（已寫回 .env，重啟後維持此網路）"
             await event.answer()
             await event.edit(msg)
+
+        @bot_client.on(events.CallbackQuery(pattern=b"sl2tog"))
+        async def _on_sl2_toggle(event):
+            """/config 的「二段止損」開關：SL2_MULT 在 0（單一止損）與 2（雙軌）間切換。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            if trader is None:
+                await event.answer("自動交易未啟用")
+                return
+            import binance_trader as bt
+            new_val = 0.0 if bt.SL2_MULT > 0 else 2.0
+            bt.SL2_MULT = new_val
+            _update_env_file("SL2_MULT", _fmt_val(new_val))
+            state = (f"開啟（SL2 = SL1 × {_fmt_val(new_val)}，雙軌半倉）" if new_val > 0
+                     else "關閉（單一止損守全倉）")
+            await event.answer()
+            await event.edit(f"✅ 二段止損已{state}\n"
+                             "（已寫回 .env；新進場立即生效，已開倉位在下次止損上移時才轉換）")
 
     # 設定 bot 指令選單（一般／管理員分流）＋ 訂閱到期背景檢查
     if BOT_TOKEN:
