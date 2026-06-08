@@ -65,7 +65,7 @@ BREAKEVEN_FEE_PCT = float(_get("BREAKEVEN_FEE_PCT", "0.1"))
 # 例：訊號SL1 -3% → 上軌 -3%、下軌 -6%；訊號SL1 -8%（超上限）→ 上軌 -5%、下軌 -10%。
 # 每中一段 TP 雙軌整組往上爬一階（保本→TP1→…）。做多往下、做空往上。
 SL1_PCT = float(_get("SL1_PCT", "5"))    # SL1 上限%（訊號更小就用訊號的）
-SL2_MULT = float(_get("SL2_MULT", "2"))  # SL2 = 生效 SL1 × 此倍數（預設 2，最深 = 上限×2）
+SL2_MULT = float(_get("SL2_MULT", "2"))  # SL2 = 生效 SL1 × 此倍數；0 = 不掛 SL2（單一止損守全倉）
 # 下單止損倍數：僅「現貨」OCO 仍沿用（合約已改用上方固定 SL1_PCT/SL2_PCT）。
 # 實際掛的止損 = 進場 + 此倍數 ×（訊號止損1 − 進場）。轉發訊息仍用訊號原始止損，不受此影響。
 SL_MULTIPLIER = float(_get("SL_MULTIPLIER", "2"))
@@ -466,9 +466,11 @@ async def _place_protection_futures(trade: dict) -> bool:
         trades.set_status(trade["id"], "CLOSED")
         return False
 
-    # 雙軌止損：初始（tier 0）→ 上軌 rung[1]（訊號SL1×倍數）、下軌 rung[0]（訊號SL2），各取半倉
+    # 止損：初始（tier 0）掛 rung[1]=SL1。SL2_MULT>0 → 雙軌（上軌 SL1、下軌 SL2 各半倉）；
+    # SL2_MULT=0 → 單軌守全倉（捨棄 SL2）。
     rungs = _sl_ladder(signal)
-    sl_ids, sl_prices = await _place_dual_sls(symbol, rungs[1], rungs[0], amt, filt)
+    sl_ids, sl_prices = await _place_dual_sls(symbol, rungs[1], rungs[0], amt, filt,
+                                              dual=SL2_MULT > 0)
 
     # 止盈：依倉位大小自動決定段數（保證金一致優先），對應最近的 N 個目標。
     # 某段若進場時已達 → 市價賣掉那段（直接落袋）。
@@ -910,20 +912,25 @@ def _sl_ladder(signal: dict) -> list[float]:
 
 
 async def _place_dual_sls(symbol: str, sl_hi: float, sl_lo: float,
-                          remaining: float, filt: dict) -> tuple[list, list]:
-    """掛雙軌 reduceOnly 半倉止損（上軌 sl_hi、下軌 sl_lo），各取剩餘倉位的一半。
-    回傳 (order_ids, prices)。某段已穿價(-2021)就市價平該段；倉位太小無法對半→單張守全部剩餘。"""
+                          remaining: float, filt: dict, dual: bool = True) -> tuple[list, list]:
+    """掛 reduceOnly 止損。dual=True：雙軌半倉（上軌 sl_hi、下軌 sl_lo 各半）；
+    dual=False：單軌守全倉（只掛 sl_hi）。回傳 (order_ids, prices)。
+    某段已穿價(-2021)就市價平該段；雙軌倉位太小無法對半→退回單張守全部剩餘。"""
     _, close_side = _sides()
     min_qty = float(filt["min_qty"])
     hi = _quantize(sl_hi, filt["tick"])
     lo = _quantize(sl_lo, filt["tick"])
-    half = _quantize(remaining / 2, filt["step"])
-    rest = _quantize(remaining - float(half), filt["step"])
-    if float(half) < min_qty or float(rest) < min_qty:
-        legs = [(hi, _quantize(remaining, filt["step"]))]   # 太小→單張守全部剩餘，掛較保守的上軌
+    if not dual:
+        legs = [(hi, _quantize(remaining, filt["step"]))]       # 單一止損：守全倉
     else:
-        legs = [(hi, half), (lo, rest)]
+        half = _quantize(remaining / 2, filt["step"])
+        rest = _quantize(remaining - float(half), filt["step"])
+        if float(half) < min_qty or float(rest) < min_qty:
+            legs = [(hi, _quantize(remaining, filt["step"]))]   # 太小→單張守全部剩餘，掛較保守的上軌
+        else:
+            legs = [(hi, half), (lo, rest)]
 
+    portion = "半倉" if len(legs) > 1 else "全倉"
     ids, prices = [], []
     for price, qty in legs:
         if float(qty) <= 0:
@@ -934,7 +941,7 @@ async def _place_dual_sls(symbol: str, sl_hi: float, sl_lo: float,
                               quantity=format(qty, "f"), reduceOnly="true")
             ids.append(_oid(resp))
             prices.append(float(price))
-            print(f"[trader]   SL: {close_side} {qty} @ {price}（reduceOnly 半倉）")
+            print(f"[trader]   SL: {close_side} {qty} @ {price}（reduceOnly {portion}）")
         except BinanceAPIException as e:
             if e.code != -2021:
                 raise
@@ -994,14 +1001,18 @@ async def _update_dual_sl_futures(trade: dict, info: dict, amt: float,
             await _cancel_conditional(symbol, oid)
         await _cancel_conditional(symbol, info.get("sl_order_id"))
 
-        sl_ids, sl_prices = await _place_dual_sls(symbol, float(sl_hi), float(sl_lo), amt, filt)
+        sl_ids, sl_prices = await _place_dual_sls(symbol, float(sl_hi), float(sl_lo), amt, filt,
+                                                  dual=SL2_MULT > 0)
         info["sl_orders"] = sl_ids
         info["sl_prices"] = sl_prices
         info.pop("sl_order_id", None)
         info.pop("sl_price", None)
         trades.update_oco(trade["id"], info, sl_moved=tier)
-        tail = f" / 下軌 {sl_prices[1]}" if len(sl_prices) > 1 else ""
-        print(f"[trader] trade#{trade['id']} {symbol} 已實現 TP{tier} → 止損上移：上軌 {sl_prices[0]}{tail}（各半倉）")
+        if len(sl_prices) > 1:
+            detail = f"上軌 {sl_prices[0]} / 下軌 {sl_prices[1]}（各半倉）"
+        else:
+            detail = f"{sl_prices[0]}（全倉）"
+        print(f"[trader] trade#{trade['id']} {symbol} 已實現 TP{tier} → 止損上移：{detail}")
 
 
 async def _cancel_all_futures_orders(symbol: str) -> None:
