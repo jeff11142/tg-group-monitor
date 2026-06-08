@@ -553,9 +553,10 @@ async def _send_config_panel(event) -> None:
     for key, (attr, _, _, _) in TUNABLE_PARAMS.items():
         lines.append(f"  {key} = {_fmt_val(getattr(bt, attr))}")
         buttons.append([Button.inline(f"✏️ 改 {key}", f"setparam:{key}".encode())])
-    env = "TESTNET 測試網" if bt.TESTNET else "⚠️ 正式網（真錢）"
     auto = "開" if bt.AUTO_MIN_AMOUNT else "關"
-    lines.append(f"（環境：{env}｜自動最小金額：{auto}）")
+    lines.append(f"（環境：{bt.current_network()}｜自動最小金額：{auto}）")
+    target = "正式網（真錢）" if bt.TESTNET else "測試網"
+    buttons.append([Button.inline(f"🔀 切換到{target}", b"netsw")])
     buttons.append(_cancel_row())
     await event.respond("\n".join(lines), buttons=buttons)
 
@@ -854,6 +855,56 @@ async def main() -> None:
             _pending.pop(event.sender_id, None)
             await event.answer()
             await event.edit("已取消。")
+
+        @bot_client.on(events.CallbackQuery(pattern=b"netsw"))
+        async def _on_net_switch(event):
+            """/config 的「切換網路」按鈕：先做安全檢查，再要求二次確認（正式網加重警告）。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            await event.answer()
+            if trader is None:
+                await event.respond("自動交易未啟用，無法切換網路。")
+                return
+            import binance_trader as bt
+            import trades
+            target_testnet = not bt.TESTNET
+            target_name = "測試網" if target_testnet else "正式網（真錢）"
+            n = trades.count_open()
+            if n > 0:
+                await event.respond(f"⚠️ 還有 {n} 筆未結倉，請先全部平倉再切換網路"
+                                    "（避免舊網路倉位失去自動管理）。")
+                return
+            if not target_testnet and not bt.mainnet_keys_ready():
+                await event.respond("❌ 尚未在 .env 設定正式網 API 金鑰"
+                                    "（BINANCE_MAINNET_API_KEY / SECRET），無法切到正式網。")
+                return
+            warn = ("\n\n⚠️⚠️ 這是【正式網・真錢】，切換後新訊號會用真實資金下單！"
+                    if not target_testnet else "")
+            flag = "1" if target_testnet else "0"
+            await event.respond(
+                f"確認從 {bt.current_network()} 切換到「{target_name}」？{warn}",
+                buttons=[[Button.inline(f"✅ 確認切到{target_name}", f"netok:{flag}".encode())],
+                         _cancel_row()],
+            )
+
+        @bot_client.on(events.CallbackQuery(pattern=b"netok:"))
+        async def _on_net_confirm(event):
+            """確認切換：重建 client/WS 並寫回 .env 持久化。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            if trader is None:
+                await event.answer("自動交易未啟用")
+                return
+            import binance_trader as bt
+            target_testnet = event.data.decode().split(":", 1)[1] == "1"
+            ok, msg = await bt.switch_network(target_testnet)
+            if ok:
+                _update_env_file("BINANCE_TESTNET", "1" if target_testnet else "0")
+                msg += "（已寫回 .env，重啟後維持此網路）"
+            await event.answer()
+            await event.edit(msg)
 
     # 設定 bot 指令選單（一般／管理員分流）＋ 訂閱到期背景檢查
     if BOT_TOKEN:

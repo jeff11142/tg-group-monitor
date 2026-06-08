@@ -30,8 +30,18 @@ def _get(name: str, default: str = "") -> str:
 
 
 TESTNET = _get("BINANCE_TESTNET", "1") == "1"
-API_KEY = _get("BINANCE_API_KEY")
-API_SECRET = _get("BINANCE_API_SECRET")
+
+
+def _api_keys(testnet: bool) -> tuple[str, str]:
+    """依網路取對應金鑰。測試網可退回舊的 BINANCE_API_KEY/SECRET（相容舊 .env）；
+    正式網一定要用 BINANCE_MAINNET_*（不退回，免得誤用測試網金鑰打真錢）。"""
+    if testnet:
+        return (_get("BINANCE_TESTNET_API_KEY") or _get("BINANCE_API_KEY"),
+                _get("BINANCE_TESTNET_API_SECRET") or _get("BINANCE_API_SECRET"))
+    return (_get("BINANCE_MAINNET_API_KEY"), _get("BINANCE_MAINNET_API_SECRET"))
+
+
+API_KEY, API_SECRET = _api_keys(TESTNET)
 TRADE_USDT = float(_get("TRADE_USDT", "50"))
 # 合約固定本金（USDT）：>0 時用「名目 = 本金 × 槓桿」算倉位（保證金一致優先）。0=沿用舊邏輯。
 MARGIN_USDT = float(_get("MARGIN_USDT", "0"))
@@ -94,6 +104,8 @@ _entry_lock = asyncio.Lock()
 _bg_tasks: set = set()
 # User Data Stream（WebSocket）用的非同步 client；與同步 _client 並存
 _async_client: AsyncClient | None = None
+# WebSocket 背景任務參考（切換網路時要 cancel 後重啟）
+_ws_task: "asyncio.Task | None" = None
 # 止損上移鎖：WS 即時事件與慢速保險絲都可能觸發，序列化避免重複撤單/掛單
 _sl_update_lock = asyncio.Lock()
 
@@ -107,7 +119,8 @@ def _spawn(coro) -> None:
 def init() -> None:
     global _client
     if not (API_KEY and API_SECRET):
-        raise SystemExit("交易已啟用但缺少 BINANCE_API_KEY / BINANCE_API_SECRET")
+        net = "測試網" if TESTNET else "正式網"
+        raise SystemExit(f"交易已啟用但缺少{net} API 金鑰（檢查 .env 的 BINANCE_*_API_KEY/SECRET）")
     _client = Client(API_KEY, API_SECRET, testnet=TESTNET)
     trades.init()
     net = "TESTNET 測試網" if TESTNET else "⚠️ 正式網（真錢）"
@@ -562,9 +575,55 @@ def start_monitor() -> None:
 
 async def start_user_stream() -> None:
     """啟動 User Data Stream（WebSocket）：訂單成交即時推播，取代高頻輪詢，避免 -1003 限流。"""
+    global _ws_task
     if not FUTURES:
         return
-    _spawn(_user_stream_loop())
+    _ws_task = asyncio.create_task(_user_stream_loop())
+    _bg_tasks.add(_ws_task)
+    _ws_task.add_done_callback(_bg_tasks.discard)
+
+
+def current_network() -> str:
+    """目前網路的人話描述（給 log / Bot 顯示）。"""
+    return "TESTNET 測試網" if TESTNET else "⚠️ 正式網（真錢）"
+
+
+def mainnet_keys_ready() -> bool:
+    """正式網金鑰是否已備妥（切到正式網前先確認，避免切進壞狀態）。"""
+    k, s = _api_keys(False)
+    return bool(k and s)
+
+
+async def switch_network(to_testnet: bool) -> tuple[bool, str]:
+    """切換測試/正式網：重建同步 client 與 WebSocket。**只在無未結倉時允許**。
+    回傳 (是否成功, 訊息)。持久化（寫回 .env BINANCE_TESTNET）由呼叫端負責。"""
+    global TESTNET, API_KEY, API_SECRET, _client, _ws_task
+    if to_testnet == TESTNET:
+        return False, f"目前已經是 {current_network()}，無需切換"
+    n = trades.count_open()
+    if n > 0:
+        return False, (f"⚠️ 還有 {n} 筆未結倉，請先全部平倉再切換"
+                       "（否則舊網路的倉位會失去自動管理）")
+    key, secret = _api_keys(to_testnet)
+    if not (key and secret):
+        net = "測試網" if to_testnet else "正式網"
+        return False, f"❌ 找不到{net}的 API 金鑰，請先在 .env 設好再切換"
+    # 套用新網路 + 重建同步 client
+    TESTNET, API_KEY, API_SECRET = to_testnet, key, secret
+    _client = Client(API_KEY, API_SECRET, testnet=TESTNET)
+    # 重啟 WebSocket（用新網路與金鑰重連）
+    if _ws_task and not _ws_task.done():
+        _ws_task.cancel()
+        try:
+            await _ws_task
+        except asyncio.CancelledError:
+            pass
+    if FUTURES:
+        _ws_task = asyncio.create_task(_user_stream_loop())
+        _bg_tasks.add(_ws_task)
+        _ws_task.add_done_callback(_bg_tasks.discard)
+    print(f"[trader] 已切換網路 → {current_network()}")
+    return True, f"✅ 已切換到 {current_network()}"
 
 
 async def _user_stream_loop() -> None:
