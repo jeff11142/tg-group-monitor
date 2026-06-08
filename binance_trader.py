@@ -51,10 +51,11 @@ MONITOR_INTERVAL = float(_get("TRADE_MONITOR_INTERVAL", "120"))
 BREAKEVEN_AFTER_TP1 = _get("BREAKEVEN_AFTER_TP1", "1") == "1"
 # 淨保本：移到保本時把止損設在「進場價 ×（1 ± 此手續費%）」，涵蓋來回手續費，移動後即使被掃也不虧
 BREAKEVEN_FEE_PCT = float(_get("BREAKEVEN_FEE_PCT", "0.1"))
-# 合約固定止損百分比（不看訊號 SL）：SL1=淺軌、SL2=深軌，做多往下、做空往上。
-# 雙軌初始＝（上軌 -SL1_PCT%、下軌 -SL2_PCT%）；每中一段 TP 整組往上爬一階（保本→TP1→…）。
-SL1_PCT = float(_get("SL1_PCT", "5"))
-SL2_PCT = float(_get("SL2_PCT", "10"))
+# 合約止損：SL1 = min(訊號SL1 距離, SL1_PCT 上限%)；SL2 = SL1 × SL2_MULT。
+# 例：訊號SL1 -3% → 上軌 -3%、下軌 -6%；訊號SL1 -8%（超上限）→ 上軌 -5%、下軌 -10%。
+# 每中一段 TP 雙軌整組往上爬一階（保本→TP1→…）。做多往下、做空往上。
+SL1_PCT = float(_get("SL1_PCT", "5"))    # SL1 上限%（訊號更小就用訊號的）
+SL2_MULT = float(_get("SL2_MULT", "2"))  # SL2 = 生效 SL1 × 此倍數（預設 2，最深 = 上限×2）
 # 下單止損倍數：僅「現貨」OCO 仍沿用（合約已改用上方固定 SL1_PCT/SL2_PCT）。
 # 實際掛的止損 = 進場 + 此倍數 ×（訊號止損1 − 進場）。轉發訊息仍用訊號原始止損，不受此影響。
 SL_MULTIPLIER = float(_get("SL_MULTIPLIER", "2"))
@@ -813,13 +814,33 @@ async def _cancel_conditional(symbol: str, order_id) -> None:
             print(f"[trader] 撤條件單 {order_id} 失敗（忽略續行）：{e.code} {e.message}")
 
 
+def _signal_sl1_pct(signal: dict) -> float | None:
+    """訊號 SL1 相對進場的距離（正的百分比）；缺、為 0 或方向不對則回 None。"""
+    stops = signal.get("stops") or []
+    if not stops:
+        return None
+    entry = float(signal["entry"])
+    sl1 = float(stops[0]["price"])
+    pct = (sl1 - entry) / entry * 100 if TRADE_SIDE == "SHORT" else (entry - sl1) / entry * 100
+    return pct if pct > 0 else None
+
+
+def _effective_sl_pcts(signal: dict) -> tuple[float, float]:
+    """回傳 (SL1%, SL2%)：SL1 = min(訊號SL1, 上限 SL1_PCT)；SL2 = SL1 × SL2_MULT。
+    訊號缺 SL1 或方向不對時，SL1 直接用上限。"""
+    sig = _signal_sl1_pct(signal)
+    sl1 = min(sig, SL1_PCT) if sig is not None else SL1_PCT
+    return sl1, sl1 * SL2_MULT
+
+
 def _sl_ladder(signal: dict) -> list[float]:
     """止損階梯（防守→鎖利）：[SL2, SL1, 淨保本, TP1, TP2…]。
-    SL1/SL2 用固定百分比（SL1_PCT/SL2_PCT），不再依訊號止損。做多往下、做空往上。
+    SL1 = min(訊號SL1距離, 上限 SL1_PCT)；SL2 = SL1 × SL2_MULT。做多往下、做空往上。
     雙軌取相鄰兩階：下軌=rung[tier]、上軌=rung[tier+1]（tier=已成交TP數）。"""
     entry = Decimal(str(signal["entry"]))
-    p1 = Decimal(str(SL1_PCT)) / 100
-    p2 = Decimal(str(SL2_PCT)) / 100
+    sl1_pct, sl2_pct = _effective_sl_pcts(signal)
+    p1 = Decimal(str(sl1_pct)) / 100
+    p2 = Decimal(str(sl2_pct)) / 100
     if TRADE_SIDE == "SHORT":
         sl2, sl1 = entry * (1 + p2), entry * (1 + p1)             # 做空：止損在上方
     else:

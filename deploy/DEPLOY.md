@@ -104,7 +104,7 @@ journalctl -u tg-group-monitor -n 30       # 看啟動 log 確認設定有吃到
 | `MAX_OPEN_TRADES` | 最多同時持倉筆數 | 30 |
 | `MARGIN_USDT` | **固定本金/筆**；名目 = 本金 × 槓桿 | 30 |
 | `AUTO_MIN_AMOUNT` | 必須 `0`；設 1 會走舊的保證金放大邏輯 | 0 |
-| `SL1_PCT` / `SL2_PCT` | 固定雙軌止損 %（淺軌 -5% / 深軌 -10%）| 5 / 10 |
+| `SL1_PCT` / `SL2_MULT` | SL1=min(訊號SL1, 上限%)；SL2=SL1×倍數（最深=上限×倍數）| 5 / 2 |
 | `TP_RATIOS` | 分段止盈比例（自適應，倉位小會自動降級）| 30,30,20,20 |
 | `TRADE_MONITOR_INTERVAL` | 保險絲對帳間隔（秒）；即時反應已交給 WS，這只當兜底 | 120（程式預設，未列於 .env 也生效）|
 
