@@ -466,6 +466,10 @@ async def _place_protection_futures(trade: dict) -> bool:
         trades.set_status(trade["id"], "CLOSED")
         return False
 
+    # 冪等保護：先撤掉此交易對殘留的條件單，避免重啟回復重跑到這時 SL/TP 被重複掛成兩套。
+    # 同一交易對同時只允許一筆（has_open_symbol），所以殘留的一定是本筆的舊單，可安全清掉重掛。
+    await _cancel_all_futures_orders(symbol)
+
     # 止損：初始（tier 0）掛 rung[1]=SL1。SL2_MULT>0 → 雙軌（上軌 SL1、下軌 SL2 各半倉）；
     # SL2_MULT=0 → 單軌守全倉（捨棄 SL2）。
     rungs = _sl_ladder(signal)
