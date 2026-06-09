@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
 
 import recipients
+import signal_store
 
 load_dotenv()
 
@@ -239,20 +240,26 @@ async def list_dialogs(client: TelegramClient) -> None:
         print(f"[{kind}] {dialog.name!r}  id={dialog.id}")
 
 
-async def send_bot_dm(http: httpx.AsyncClient, chat_id: int, text: str) -> bool:
-    """用 TG Bot 私訊單一 chat_id，回傳是否成功。"""
+async def send_bot_dm(http: httpx.AsyncClient, chat_id: int, text: str,
+                      reply_to: int | None = None) -> int | None:
+    """用 TG Bot 私訊單一 chat_id。回傳送出訊息的 message_id（失敗回 None）。
+    reply_to：要引用回覆的 message_id（原訊息已刪也照常送，不報錯）。"""
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+        payload["allow_sending_without_reply"] = True
     try:
         resp = await http.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload,
         )
         data = resp.json()
         if not data.get("ok"):
             print(f"[bot 發送失敗 {chat_id}] {data.get('description')}")
-        return bool(data.get("ok"))
+            return None
+        return data["result"]["message_id"]
     except Exception as e:  # 不讓單次失敗中斷監聽
         print(f"[bot 發送失敗 {chat_id}] {e}")
-        return False
+        return None
 
 
 PUBLIC_COMMANDS = [
@@ -294,14 +301,49 @@ async def setup_bot_commands(http: httpx.AsyncClient, admin_id: int | None) -> N
         print(f"[bot] 設定指令選單失敗：{e}")
 
 
-async def broadcast_via_bot(http: httpx.AsyncClient, text: str) -> None:
-    """用 TG Bot 廣播給「已啟用且未到期」的訂閱者。"""
+async def broadcast_via_bot(http: httpx.AsyncClient, text: str,
+                            reply_map: dict[int, int] | None = None) -> dict[int, int]:
+    """用 TG Bot 廣播給「已啟用且未到期」的訂閱者。
+    reply_map：{chat_id: 要回覆引用的 message_id}，讓 TP/SL 通知掛在該位的進場訊息下。
+    回傳 {chat_id: 本次送出的 message_id}，供記錄。"""
     ids = recipients.list_active_ids()
     if not ids:
         print("[broadcast] 沒有任何有效訂閱者，訊息略過")
-        return
+        return {}
+    sent: dict[int, int] = {}
     for chat_id in ids:
-        await send_bot_dm(http, chat_id, text)
+        mid = await send_bot_dm(http, chat_id, text, reply_to=(reply_map or {}).get(chat_id))
+        if mid:
+            sent[chat_id] = mid
+    return sent
+
+
+async def _bot_broadcast(http: httpx.AsyncClient, text: str,
+                         signal: dict | None, target_hit: dict | None,
+                         stop_hit: dict | None) -> None:
+    """廣播並串起訊號脈絡：
+    - 進場訊號：先存進 signal_store，廣播後記錄每位收件人的 message_id。
+    - TP/SL 通知：找出該交易對最近的訊號，逐位「回覆引用」其進場訊息（使用者可一鍵跳回）。"""
+    if signal is not None:
+        sig_id = signal_store.add_signal(
+            signal["symbol"], signal["entry"], signal["targets"], signal["stops"],
+            meta={k: signal[k] for k in ("risk", "volume_rank", "market_cap", "url")
+                  if k in signal},
+        )
+        sent = await broadcast_via_bot(http, text)
+        for cid, mid in sent.items():
+            signal_store.record_message(sig_id, cid, mid)
+        return
+
+    hit = target_hit or stop_hit
+    reply_map: dict[int, int] = {}
+    if hit is not None:
+        sig_id = signal_store.latest_signal_id(hit["symbol"])
+        if sig_id is not None:
+            reply_map = signal_store.messages_for(sig_id)
+            if stop_hit is not None:
+                signal_store.close_signal(sig_id)  # 觸發停損 → 該訊號收尾
+    await broadcast_via_bot(http, text, reply_map=reply_map)
 
 
 async def _subscription_loop() -> None:
@@ -689,6 +731,7 @@ async def main() -> None:
 
     # 初始化接收者 DB；若 DB 空且設了 BOT_TARGET，自動把 BOT_TARGET 灌進去當第一筆
     recipients.init()
+    signal_store.init()
     if recipients.count() == 0 and BOT_TARGET:
         try:
             recipients.add(int(BOT_TARGET), name="bootstrap")
@@ -1005,7 +1048,7 @@ async def main() -> None:
         # Bot 廣播、Webhook、自動下單三者「同時」並行觸發，互不等待
         jobs = []
         if BOT_TOKEN:
-            jobs.append(broadcast_via_bot(http, formatted))
+            jobs.append(_bot_broadcast(http, formatted, signal, target_hit, stop_hit))
         if WEBHOOK_URL:
             jobs.append(send_webhook(http, payload))
         # 只有「解析成功的進場訊號」才自動下單；目標達成通知不下單
