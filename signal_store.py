@@ -33,6 +33,7 @@ def init() -> None:
                 stops      TEXT NOT NULL,
                 meta       TEXT,
                 status     TEXT NOT NULL DEFAULT 'open',
+                notified   TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             )
             """
@@ -48,6 +49,10 @@ def init() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol, id)")
+        # 舊 DB 遷移：補上 notified 欄位（記錄已通知過的 TP/SL 層級，避免每秒重複通知）
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(signals)")}
+        if "notified" not in cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN notified TEXT NOT NULL DEFAULT '{}'")
 
 
 def add_signal(symbol: str, entry: float, targets: list, stops: list,
@@ -111,6 +116,34 @@ def close_signal(signal_id: int) -> None:
         conn.execute("UPDATE signals SET status = 'closed' WHERE id = ?", (signal_id,))
 
 
+def open_signals() -> list[dict]:
+    """所有 status='open' 的訊號（含 targets/stops/notified 解析），供行情監聽逐筆比對。"""
+    with _conn() as conn:
+        rows = conn.execute("SELECT * FROM signals WHERE status = 'open' ORDER BY id").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["targets"] = json.loads(d["targets"])
+        d["stops"] = json.loads(d["stops"])
+        d["notified"] = json.loads(d["notified"]) if d.get("notified") else {}
+        out.append(d)
+    return out
+
+
+def record_hit(signal_id: int, kind: str, level: int) -> None:
+    """記下「某訊號的 TP/SL 某層級已通知過」。kind: 'tp' 或 'sl'。"""
+    with _conn() as conn:
+        row = conn.execute("SELECT notified FROM signals WHERE id = ?", (signal_id,)).fetchone()
+        if not row:
+            return
+        notified = json.loads(row["notified"]) if row["notified"] else {}
+        levels = notified.setdefault(kind, [])
+        if level not in levels:
+            levels.append(level)
+        conn.execute("UPDATE signals SET notified = ? WHERE id = ?",
+                     (json.dumps(notified), signal_id))
+
+
 def get_signal(signal_id: int) -> dict | None:
     with _conn() as conn:
         row = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
@@ -120,4 +153,5 @@ def get_signal(signal_id: int) -> dict | None:
         d["targets"] = json.loads(d["targets"])
         d["stops"] = json.loads(d["stops"])
         d["meta"] = json.loads(d["meta"]) if d.get("meta") else {}
+        d["notified"] = json.loads(d["notified"]) if d.get("notified") else {}
         return d

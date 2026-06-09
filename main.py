@@ -318,32 +318,90 @@ async def broadcast_via_bot(http: httpx.AsyncClient, text: str,
     return sent
 
 
-async def _bot_broadcast(http: httpx.AsyncClient, text: str,
-                         signal: dict | None, target_hit: dict | None,
-                         stop_hit: dict | None) -> None:
-    """廣播並串起訊號脈絡：
-    - 進場訊號：先存進 signal_store，廣播後記錄每位收件人的 message_id。
-    - TP/SL 通知：找出該交易對最近的訊號，逐位「回覆引用」其進場訊息（使用者可一鍵跳回）。"""
-    if signal is not None:
-        sig_id = signal_store.add_signal(
-            signal["symbol"], signal["entry"], signal["targets"], signal["stops"],
-            meta={k: signal[k] for k in ("risk", "volume_rank", "market_cap", "url")
-                  if k in signal},
-        )
-        sent = await broadcast_via_bot(http, text)
-        for cid, mid in sent.items():
-            signal_store.record_message(sig_id, cid, mid)
-        return
+async def _broadcast_signal(http: httpx.AsyncClient, text: str, signal: dict) -> None:
+    """廣播進場訊號，存進 signal_store，並記錄每位收件人的 message_id（供 TP/SL 通知回覆引用）。"""
+    sig_id = signal_store.add_signal(
+        signal["symbol"], signal["entry"], signal["targets"], signal["stops"],
+        meta={k: signal[k] for k in ("risk", "volume_rank", "market_cap", "url") if k in signal},
+    )
+    sent = await broadcast_via_bot(http, text)
+    for cid, mid in sent.items():
+        signal_store.record_message(sig_id, cid, mid)
 
-    hit = target_hit or stop_hit
-    reply_map: dict[int, int] = {}
-    if hit is not None:
-        sig_id = signal_store.latest_signal_id(hit["symbol"])
-        if sig_id is not None:
-            reply_map = signal_store.messages_for(sig_id)
-            if stop_hit is not None:
-                signal_store.close_signal(sig_id)  # 觸發停損 → 該訊號收尾
-    await broadcast_via_bot(http, text, reply_map=reply_map)
+
+async def _notify_hit(http: httpx.AsyncClient, signal_id: int, text: str) -> None:
+    """TP/SL 達標通知：廣播給訂閱者，逐位回覆引用其進場訊息（使用者可一鍵跳回）。"""
+    await broadcast_via_bot(http, text, reply_map=signal_store.messages_for(signal_id))
+
+
+async def _check_signal_hits(http: httpx.AsyncClient, prices: dict[str, float]) -> None:
+    """拿全市場標記價，比對每筆 open 訊號的 TP/SL（做多：價≥TP 觸發、價≤SL 觸發），
+    每個層級只通知一次；觸發停損或全部 TP 達標 → 收尾該訊號。"""
+    now = datetime.now(timezone.utc).astimezone()
+    for sig in signal_store.open_signals():
+        px = prices.get(sig["symbol"])
+        if px is None:
+            continue
+        tp_done = set(sig["notified"].get("tp", []))
+        sl_done = set(sig["notified"].get("sl", []))
+        for t in sig["targets"]:
+            if t["level"] not in tp_done and px >= t["price"]:
+                hit = {"symbol": sig["symbol"], "hits": [{"level": t["level"], "price": t["price"]}]}
+                await _notify_hit(http, sig["id"], format_target_hit(hit, now))
+                signal_store.record_hit(sig["id"], "tp", t["level"])
+                tp_done.add(t["level"])
+                print(f"[watch] {sig['symbol']} TP{t['level']} 達標 @ {px}")
+        sl_triggered = False
+        for s in sig["stops"]:
+            if s["level"] not in sl_done and px <= s["price"]:
+                hit = {"symbol": sig["symbol"], "hits": [{"level": s["level"], "price": s["price"]}]}
+                await _notify_hit(http, sig["id"], format_stop_hit(hit, now))
+                signal_store.record_hit(sig["id"], "sl", s["level"])
+                print(f"[watch] {sig['symbol']} SL{s['level']} 觸發 @ {px}")
+                signal_store.close_signal(sig["id"])   # 觸發停損 → 收尾，停止監聽
+                sl_triggered = True
+                break
+        if not sl_triggered and sig["targets"] and all(t["level"] in tp_done for t in sig["targets"]):
+            signal_store.close_signal(sig["id"])       # 全部 TP 達標 → 收尾
+            print(f"[watch] {sig['symbol']} 全部 TP 達標 → 收尾")
+
+
+async def _price_watch_loop(http: httpx.AsyncClient) -> None:
+    """公開行情 WS（主網全市場標記價，免金鑰）：偵測 open 訊號的 TP/SL 觸發並通知。
+    注意：一律用主網真價，因為訊號的 TP/SL 是真實市場價位（與自動交易是否 testnet 無關）。"""
+    try:
+        from binance import AsyncClient, BinanceSocketManager
+    except ImportError:
+        print("[watch] 未安裝 python-binance，TP/SL 行情監聽停用")
+        return
+    backoff = 1
+    while True:
+        client = None
+        try:
+            client = await AsyncClient.create()   # 主網公開行情，不需金鑰
+            bsm = BinanceSocketManager(client)
+            async with bsm.all_mark_price_socket(fast=True) as stream:
+                print("[watch] 行情 WS 已連線，監聽訊號 TP/SL（標記價）")
+                backoff = 1
+                while True:
+                    msg = await stream.recv()
+                    arr = msg.get("data") if isinstance(msg, dict) else msg
+                    if not isinstance(arr, list):
+                        continue
+                    prices = {it["s"]: float(it["p"]) for it in arr if it.get("s") and it.get("p")}
+                    await _check_signal_hits(http, prices)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[watch] 行情 WS 中斷，{backoff}s 後重連：{e!r}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        finally:
+            if client is not None:
+                try:
+                    await client.close_connection()
+                except Exception:
+                    pass
 
 
 async def _subscription_loop() -> None:
@@ -976,6 +1034,7 @@ async def main() -> None:
     if BOT_TOKEN:
         await setup_bot_commands(http, admin_id)
         asyncio.create_task(_subscription_loop())
+        asyncio.create_task(_price_watch_loop(http))  # 行情 WS 偵測訊號 TP/SL 並通知
 
     # 啟用幣安現貨自動交易（延遲 import，沒開就不需要裝 python-binance）
     trader = None
@@ -1045,10 +1104,11 @@ async def main() -> None:
         if LOG_TO_FILE:
             write_log(payload)
 
-        # Bot 廣播、Webhook、自動下單三者「同時」並行觸發，互不等待
+        # Bot 廣播、Webhook、自動下單並行觸發，互不等待。
+        # 只有「進場訊號」用 Bot 廣播給訂閱者；來源的達標/停損訊息不再轉發 —— 改由行情 WS 自行偵測通知。
         jobs = []
-        if BOT_TOKEN:
-            jobs.append(_bot_broadcast(http, formatted, signal, target_hit, stop_hit))
+        if BOT_TOKEN and signal is not None:
+            jobs.append(_broadcast_signal(http, formatted, signal))
         if WEBHOOK_URL:
             jobs.append(send_webhook(http, payload))
         # 只有「解析成功的進場訊號」才自動下單；目標達成通知不下單
