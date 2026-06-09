@@ -52,8 +52,14 @@ def init() -> None:
 
 def add_signal(symbol: str, entry: float, targets: list, stops: list,
                meta: dict | None = None) -> int:
-    """新增一筆進場訊號，回傳 signal_id。"""
+    """新增一筆進場訊號，回傳 signal_id。
+    同幣舊的 open 會被標記為 'superseded'（保留歷史、只改狀態），
+    確保每個幣同時最多一筆 open（引用一律取最新那筆）。"""
     with _conn() as conn:
+        conn.execute(
+            "UPDATE signals SET status = 'superseded' WHERE symbol = ? AND status = 'open'",
+            (symbol,),
+        )
         cur = conn.execute(
             "INSERT INTO signals (symbol, entry, targets, stops, meta, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
