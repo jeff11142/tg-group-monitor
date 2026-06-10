@@ -5,6 +5,8 @@ DB 檔預設在專案目錄底下的 recipients.db，
 """
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 DB_FILE = "recipients.db"
@@ -14,10 +16,16 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _conn() -> sqlite3.Connection:
+@contextmanager
+def _conn() -> Iterator[sqlite3.Connection]:
+    # sqlite3 的 `with conn:` 只管交易，不會關閉連線；這裡確保用完一定 close，避免 fd 洩漏
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init() -> None:
