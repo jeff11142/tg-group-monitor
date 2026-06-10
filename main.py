@@ -399,7 +399,10 @@ async def _price_watch_loop(http: httpx.AsyncClient) -> None:
     while True:
         client = None
         try:
-            client = await AsyncClient.create()   # 主網公開行情，不需金鑰
+            # 不用 AsyncClient.create()：它先建 session 再 ping，ping 失敗時 session 會洩漏；
+            # 改為先建構（同步、必定可關閉），ping 失敗也會走 finally 關閉
+            client = AsyncClient()   # 主網公開行情，不需金鑰
+            await client.ping()
             bsm = BinanceSocketManager(client)
             async with bsm.all_mark_price_socket(fast=True) as stream:
                 print("[watch] 行情 WS 已連線，監聽訊號 TP/SL（標記價）")

@@ -13,6 +13,8 @@ WorkingDirectory=/opt/tg-group-monitor
 ExecStart=/opt/tg-group-monitor/.venv/bin/python /opt/tg-group-monitor/main.py
 Restart=always
 RestartSec=10
+# 拉高開檔上限：WS 重連風暴或突發流量時的保險，避免 [Errno 24] Too many open files 連鎖崩潰
+LimitNOFILE=65536
 # 斷線/錯誤自動重啟；連續失敗也不放棄
 StartLimitIntervalSec=0
 

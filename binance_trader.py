@@ -670,7 +670,10 @@ async def _user_stream_loop() -> None:
     backoff = 1
     while True:
         try:
-            _async_client = await AsyncClient.create(API_KEY, API_SECRET, testnet=TESTNET)
+            # 不用 AsyncClient.create()：它先建 session 再 ping，ping 失敗時 session 會洩漏；
+            # 改為先建構（同步、必定可關閉），ping 失敗也會走 finally 關閉
+            _async_client = AsyncClient(API_KEY, API_SECRET, testnet=TESTNET)
+            await _async_client.ping()
             bsm = BinanceSocketManager(_async_client)
             async with bsm.futures_user_socket() as stream:
                 print("[trader] WebSocket 已連線，即時監聽訂單/倉位更新")
