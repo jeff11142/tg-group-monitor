@@ -146,6 +146,18 @@ def parse_signal(text: str) -> dict | None:
     return signal
 
 
+def _our_sl1(signal: dict) -> dict | None:
+    """算出我們自己的單一 SL1：沿用交易模組「訊號SL1 與 SL1_PCT 上限取小」的計算。
+    接收訊號當下呼叫一次、覆蓋 signal['stops']，之後通知/廣播/存DB/下單全程沿用，不再碰訊號源。
+    交易模組不可用（純通知部署）時退回訊號原始 SL1。"""
+    try:
+        import binance_trader as bt
+        return bt.effective_sl1(signal)
+    except Exception:
+        stops = signal.get("stops") or []
+        return stops[0] if stops else None
+
+
 def format_signal(signal: dict, when: datetime) -> str:
     """把結構化訊號格式化成自訂版面。"""
     lines = [
@@ -657,6 +669,10 @@ async def _send_config_panel(event) -> None:
     sl2_desc = f"開（SL2 = SL1 × {_fmt_val(bt.SL2_MULT)}）" if sl2_on else "關（單一止損守全倉）"
     lines.append(f"  二段止損(SL2) = {sl2_desc}")
     buttons.append([Button.inline(f"🛑 二段止損：點此{'關閉' if sl2_on else '開啟'}", b"sl2tog")])
+    be_on = bt.BREAKEVEN_AFTER_TP1
+    be_desc = "開（TP 成交後止損逐段上移鎖利）" if be_on else "關（止損固定在 SL1 不動）"
+    lines.append(f"  動態止損 = {be_desc}")
+    buttons.append([Button.inline(f"📈 動態止損：點此{'關閉' if be_on else '開啟'}", b"betog")])
     auto = "開" if bt.AUTO_MIN_AMOUNT else "關"
     lines.append(f"（環境：{bt.current_network()}｜自動最小金額：{auto}）")
     target = "正式網（真錢）" if bt.TESTNET else "測試網"
@@ -1030,6 +1046,26 @@ async def main() -> None:
             await event.edit(f"✅ 二段止損已{state}\n"
                              "（已寫回 .env；新進場立即生效，已開倉位在下次止損上移時才轉換）")
 
+        @bot_client.on(events.CallbackQuery(pattern=b"betog"))
+        async def _on_be_toggle(event):
+            """/config 的「動態止損」開關：BREAKEVEN_AFTER_TP1 在 開/關 間切換。
+            開＝TP 成交後止損逐段上移鎖利；關＝止損固定在 SL1 不動。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            if trader is None:
+                await event.answer("自動交易未啟用")
+                return
+            import binance_trader as bt
+            new_val = not bt.BREAKEVEN_AFTER_TP1
+            bt.BREAKEVEN_AFTER_TP1 = new_val
+            _update_env_file("BREAKEVEN_AFTER_TP1", "1" if new_val else "0")
+            state = ("開啟（TP 成交後止損逐段上移鎖利）" if new_val
+                     else "關閉（止損固定在 SL1 不動）")
+            await event.answer()
+            await event.edit(f"✅ 動態止損已{state}\n"
+                             "（已寫回 .env；新進場立即生效，已開倉位於下次 TP 成交時依新設定處理）")
+
     # 設定 bot 指令選單（一般／管理員分流）＋ 訂閱到期背景檢查
     if BOT_TOKEN:
         await setup_bot_commands(http, admin_id)
@@ -1070,6 +1106,10 @@ async def main() -> None:
 
         now_local = datetime.now(timezone.utc).astimezone()
         signal = parse_signal(text)
+        if signal:
+            # 一接收即把停損換成我們算出的單一 SL1（≤SL1_PCT 上限）；之後全程只用這個，不再出現訊號源 SL
+            our_sl1 = _our_sl1(signal)
+            signal["stops"] = [our_sl1] if our_sl1 else []
         target_hit = None if signal else parse_target_hit(text)
         stop_hit = None if (signal or target_hit) else parse_stop_hit(text)
         if signal:

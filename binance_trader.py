@@ -898,6 +898,15 @@ def _effective_sl_pcts(signal: dict) -> tuple[float, float]:
     return sl1, sl1 * SL2_MULT
 
 
+def effective_sl1(signal: dict) -> dict:
+    """通知用：實際下單會掛的單一 SL1（沿用 _effective_sl_pcts 的「訊號SL1 與上限取小」）。
+    回 {level, price, pct}，價格與下單上軌一致；僅供顯示，未依交易對 tick 取整。"""
+    entry = float(signal["entry"])
+    sl1_pct, _ = _effective_sl_pcts(signal)
+    price = entry * (1 + sl1_pct / 100) if TRADE_SIDE == "SHORT" else entry * (1 - sl1_pct / 100)
+    return {"level": 1, "price": round(price, 8), "pct": round((price - entry) / entry * 100, 2)}
+
+
 def _sl_ladder(signal: dict) -> list[float]:
     """止損階梯（防守→鎖利）：[SL2, SL1, 淨保本, TP1, TP2…]。
     SL1 = min(訊號SL1距離, 上限 SL1_PCT)；SL2 = SL1 × SL2_MULT。做多往下、做空往上。
