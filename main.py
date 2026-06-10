@@ -356,13 +356,22 @@ async def _check_signal_hits(http: httpx.AsyncClient, prices: dict[str, float]) 
             continue
         tp_done = set(sig["notified"].get("tp", []))
         sl_done = set(sig["notified"].get("sl", []))
+        tp_hit_now = False
         for t in sig["targets"]:
             if t["level"] not in tp_done and px >= t["price"]:
                 hit = {"symbol": sig["symbol"], "hits": [{"level": t["level"], "price": t["price"]}]}
                 await _notify_hit(http, sig["id"], format_target_hit(hit, now))
                 signal_store.record_hit(sig["id"], "tp", t["level"])
                 tp_done.add(t["level"])
+                tp_hit_now = True
                 print(f"[watch] {sig['symbol']} TP{t['level']} 達標 @ {px}")
+        # 訊號已達 TP：若我們掛在低點的限價進場單還沒成交，追高沒意義 → 撤掉未成交進場單、釋放額度
+        if tp_hit_now and TRADING_ENABLED:
+            try:
+                import binance_trader as bt
+                await bt.cancel_pending_entry(sig["symbol"], reason="訊號已達 TP")
+            except Exception as e:
+                print(f"[watch] 撤未成交進場單失敗 {sig['symbol']}：{e!r}")
         sl_triggered = False
         for s in sig["stops"]:
             if s["level"] not in sl_done and px <= s["price"]:

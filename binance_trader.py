@@ -400,6 +400,38 @@ async def _handle_entry_timeout(tid: int, symbol: str, order_id: int, order: dic
     return False
 
 
+async def cancel_pending_entry(symbol: str, reason: str = "") -> bool:
+    """撤掉某交易對「尚未成交」的限價進場單並釋放額度。
+    用途：訊號已達 TP，但我們掛在低點的限價進場單一直沒成交 → 追高無意義，直接撤單。
+    保險：撤單後若發現其實剛好成交，就不取消、留給 _watch_and_protect 照常掛保護單。
+    回傳是否真的撤了一筆。"""
+    if _client is None:
+        return False
+    acted = False
+    for t in trades.list_status("PENDING_BUY"):
+        if t["symbol"] != symbol:
+            continue
+        oid = t["buy_order_id"]
+        try:
+            await _cancel_order(symbol, oid)
+        except BinanceAPIException as e:
+            if e.code != -2011:  # -2011 = 訂單已不存在（剛成交/已撤），其餘錯誤記錄後略過該筆
+                print(f"[trader] 撤未成交進場單失敗 {symbol} trade#{t['id']}：{e.code} {e.message}")
+                continue
+        # 撤單瞬間可能剛好成交：重查最終狀態，已成交就保留（_watch_and_protect 會接手掛保護）
+        try:
+            order = await _get_order(symbol, oid)
+            if order.get("status") == "FILLED":
+                print(f"[trader] {symbol} trade#{t['id']} 撤單前其實已成交，保留並照常保護{reason}")
+                continue
+        except BinanceAPIException:
+            pass  # 查不到就當已撤
+        trades.set_status(t["id"], "CANCELED")
+        acted = True
+        print(f"[trader] {symbol} 進場單未成交、{reason or '訊號已達 TP'} → 撤單釋放額度（trade#{t['id']}）")
+    return acted
+
+
 def _adaptive_portions(qty_total: Decimal, step: str, min_qty,
                        n_targets: int) -> list[Decimal]:
     """保證金一致優先：依倉位大小自動決定止盈段數。
