@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 改成你 VPS 上實際的使用者與路徑
-User=ubuntu
+# 改成你 VPS 上實際的使用者與路徑（使用者不存在會 status=217/USER 起不來）
+User=root
 # 讓 Python print 即時寫進 journal（否則輸出會被緩衝、journalctl 看不到）
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/opt/tg-group-monitor
