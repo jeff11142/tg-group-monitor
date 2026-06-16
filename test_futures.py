@@ -1,15 +1,16 @@
 """離線測試：合約（Futures）下單與對帳邏輯。不連網。
 
 注入假 futures client，驗證：
-- 進場 → 成交 → 掛 4 張 reduce-only 止盈 + 1 張 closePosition 止損
+- 進場 → 成交 → 掛 4 張 reduce-only 止盈 + 2 張 reduce-only 雙軌半倉止損
 - 倉位歸零 → 自動收單 CLOSED
-- 倉位減少（止盈成交）→ 止損移到保本
+- 倉位減少（止盈成交）→ 雙軌止損上移一階
 
 跑法：python test_futures.py
 """
 
 import asyncio
 import tempfile
+from decimal import Decimal
 
 import trades
 import binance_trader as bt
@@ -105,7 +106,7 @@ SIGNAL = {
 
 
 async def scenario_entry_and_protection():
-    print("\n[合約-1] 進場成交 → 掛 4 止盈(reduceOnly) + 1 止損(closePosition)")
+    print("\n[合約-1] 進場成交 → 掛 4 止盈(reduceOnly) + 2 止損(reduceOnly 雙軌半倉)")
     fake = bt._client = FakeFuturesClient()
     bt._filters_cache.clear()
     await bt.on_signal(SIGNAL)
@@ -117,8 +118,8 @@ async def scenario_entry_and_protection():
     sls = [c for c in fake.created if c.get("type") == "STOP_MARKET"]
     check("1 張進場 LIMIT 單", len(entries) == 1)
     check("4 張 reduce-only 止盈", len(tps) == 4 and all(t["reduceOnly"] == "true" for t in tps))
-    check("1 張 closePosition 止損", len(sls) == 1 and sls[0]["closePosition"] == "true")
-    check("止損價在 SL1=95", sls[0]["stopPrice"] == "95.00")
+    check("2 張 reduce-only 雙軌止損", len(sls) == 2 and all(s["reduceOnly"] == "true" for s in sls))
+    check("止損價在 SL1=95、SL2=90", {s["stopPrice"] for s in sls} == {"95.00", "90.00"})
     t = trades.list_status("ACTIVE")[-1]
     check("交易進入 ACTIVE 且記下合約保護單", t["oco_orders"].get("mode") == "futures")
     return t["id"]
@@ -138,25 +139,31 @@ async def scenario_position_closed():
 
 
 async def scenario_breakeven():
-    print("\n[合約-3] 倉位減少（止盈成交）→ 止損移到保本")
+    print("\n[合約-3] TP1 成交 → 雙軌止損上移一階（下軌→SL1、上軌→淨保本）")
     fake = bt._client = FakeFuturesClient(price="103")  # 現價高於進場
     bt._filters_cache.clear()
-    bt.TP_FAILSAFE = False  # 隔離測試移保本，不讓 TP 保險絲搶先觸發
+    bt.TP_FAILSAFE = False  # 隔離測試止損上移，不讓 TP 保險絲搶先觸發
     await bt.on_signal(SIGNAL)
     await asyncio.sleep(0.2)
     tid = trades.list_status("ACTIVE")[-1]["id"]
-    orig_qty = trades.get(tid)["qty"]
-    fake.position_amt = str(orig_qty * 0.6)  # 倉位剩 60% = 有止盈成交
+    info = trades.get(tid)["oco_orders"]
+    # 模擬 TP1 成交：新版以「TP 條件單是否還掛著」判定已實現第幾段，故把 TP1 從掛單移除
+    tp1_id = next(o["order_id"] for o in info["tp_orders"] if o["level"] == 1)
+    fake.open_conditional = [o for o in fake.open_conditional if o["algoId"] != tp1_id]
+    fake.position_amt = str(trades.get(tid)["qty"] - 0.09)  # 倉位減去 TP1 那段
     fake.canceled.clear()
     before_sl = [c for c in fake.created if c.get("type") == "STOP_MARKET"]
     await bt._reconcile(trades.get(tid))
     after_sl = [c for c in fake.created if c.get("type") == "STOP_MARKET"]
+    new_sl = after_sl[len(before_sl):]
     t = trades.get(tid)
-    check("撤掉舊止損", len(fake.canceled) == 1)
-    check("重掛新止損在保本價 100", after_sl[-1]["stopPrice"] == "100.00")
-    check("新止損仍是 closePosition", after_sl[-1]["closePosition"] == "true")
-    check("sl_moved 已設", t["sl_moved"] == 1)
-    check("多掛了一張止損", len(after_sl) == len(before_sl) + 1)
+    be = format(bt._quantize(float(bt._net_breakeven_price(Decimal(str(SIGNAL["entry"])))), "0.01"), "f")
+    check("撤掉兩道舊止損", len(fake.canceled) == 2)
+    check("重掛兩道新止損（各半倉 reduceOnly）",
+          len(new_sl) == 2 and all(s["reduceOnly"] == "true" for s in new_sl))
+    check(f"上軌移到淨保本 {be}、下軌移到 SL1=95",
+          {s["stopPrice"] for s in new_sl} == {be, "95.00"})
+    check("sl_moved = 1（已上移一階）", t["sl_moved"] == 1)
 
 
 async def scenario_timeout_but_filled():
@@ -178,7 +185,7 @@ async def scenario_sl_failsafe():
     print("\n[合約-5] 價格穿過止損但倉位還在 → 保險絲主動市價平倉")
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
-    fake = bt._client = FakeFuturesClient(price="94")  # 現價 94 < SL 95
+    fake = bt._client = FakeFuturesClient(price="89")  # 現價 89 < 最深止損 SL2=90（雙軌保險絲看最深那道）
     bt._filters_cache.clear()
     bt.SL_FAILSAFE = True
     bt.TP_FAILSAFE = True
@@ -280,9 +287,34 @@ async def scenario_sl_place_fail_failsafe():
     active = trades.list_status("ACTIVE")
     check("交易仍進 ACTIVE（沒卡 PENDING_BUY）", len(active) == 1)
     info = active[0]["oco_orders"]
-    check("有存 sl_price 供保險絲", info.get("sl_price") == 95.0)
-    check("sl_order_id 為 None（交易所 SL 沒掛上）", info.get("sl_order_id") is None)
+    check("有存 sl_prices 供保險絲（含 SL1=95）", 95.0 in (info.get("sl_prices") or []))
+    check("交易所 SL 沒掛上（sl_orders 為空）", not info.get("sl_orders"))
     check("4 段 TP 仍正常掛上", len(info.get("tp_orders")) == 4)
+
+
+async def scenario_raw_signal_mode():
+    print("\n[合約-11] 原始訊號做單：止損照訊號原始 SL1/SL2，不走重算")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="100")
+    bt._filters_cache.clear()
+    bt.RAW_SIGNAL_MODE = True
+    # stops 是主流程覆蓋後的單一 SL1；source_stops 是訊號原始 SL1/SL2。raw 模式應採用 source_stops。
+    raw_signal = {
+        "symbol": "BTCUSDT", "entry": 100.0,
+        "targets": [{"level": i + 1, "price": 100 * (1 + 0.01 * (i + 1)), "pct": 0} for i in range(4)],
+        "stops": [{"level": 1, "price": 97.0, "pct": 0}],
+        "source_stops": [{"level": 1, "price": 96.0, "pct": 0}, {"level": 2, "price": 93.0, "pct": 0}],
+    }
+    try:
+        await bt.on_signal(raw_signal)
+        await asyncio.sleep(0.2)
+        sls = [c for c in fake.created if c.get("type") == "STOP_MARKET"]
+        check("2 張雙軌止損", len(sls) == 2)
+        check("止損照訊號原始 SL1=96、SL2=93（非重算的 95/90）",
+              {s["stopPrice"] for s in sls} == {"96.00", "93.00"})
+    finally:
+        bt.RAW_SIGNAL_MODE = False
 
 
 async def main():
@@ -305,6 +337,7 @@ async def main():
     await scenario_sl_immediate_trigger()
     await scenario_no_position_on_protect()
     await scenario_sl_place_fail_failsafe()
+    await scenario_raw_signal_mode()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 

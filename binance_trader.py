@@ -66,6 +66,9 @@ BREAKEVEN_FEE_PCT = float(_get("BREAKEVEN_FEE_PCT", "0.1"))
 # 每中一段 TP 雙軌整組往上爬一階（保本→TP1→…）。做多往下、做空往上。
 SL1_PCT = float(_get("SL1_PCT", "5"))    # SL1 上限%（訊號更小就用訊號的）
 SL2_MULT = float(_get("SL2_MULT", "2"))  # SL2 = 生效 SL1 × 此倍數；0 = 不掛 SL2（單一止損守全倉）
+# 原始訊號直通：1=直接用訊號原始 SL1/SL2 價位掛止損（TP 本來就照訊號）；
+# 0=用過濾重算的 SL 階梯（SL1_PCT 上限／SL2_MULT）。可用 /config 即時切換。
+RAW_SIGNAL_MODE = _get("RAW_SIGNAL_MODE", "0") == "1"
 # 下單止損倍數：僅「現貨」OCO 仍沿用（合約已改用上方固定 SL1_PCT/SL2_PCT）。
 # 實際掛的止損 = 進場 + 此倍數 ×（訊號止損1 − 進場）。轉發訊息仍用訊號原始止損，不受此影響。
 SL_MULTIPLIER = float(_get("SL_MULTIPLIER", "2"))
@@ -508,6 +511,15 @@ async def _place_protection_futures(trade: dict) -> bool:
     sl_ids, sl_prices = await _place_dual_sls(symbol, rungs[1], rungs[0], amt, filt,
                                               dual=SL2_MULT > 0)
 
+    # 進場即穿所有止損：每道 SL 都被 -2021 拒、已逐腿市價平倉，倉位已了結（沒掛上單、也沒交保險絲的價）。
+    # 不再掛 TP（避免留下對應已平倉位的裸 TP 單），直接收單，不留 ACTIVE 裸倉。
+    # 注意：非 -2021 失敗會把價記進 sl_prices 交保險絲（倉位還在），不走這條，保持 ACTIVE。
+    if not sl_ids and not sl_prices:
+        print(f"[trader] {symbol} 進場即穿所有止損，已市價平倉，trade#{trade['id']} → CLOSED")
+        await _cancel_all_futures_orders(symbol)
+        trades.set_status(trade["id"], "CLOSED")
+        return False
+
     # 止盈：依倉位大小自動決定段數（保證金一致優先），對應最近的 N 個目標。
     # 某段若進場時已達 → 市價賣掉那段（直接落袋）。
     portions = _adaptive_portions(Decimal(str(trade["qty"])), filt["step"],
@@ -942,18 +954,35 @@ def effective_sl1(signal: dict) -> dict:
     return {"level": 1, "price": round(price, 8), "pct": round((price - entry) / entry * 100, 2)}
 
 
+def _raw_signal_stops(signal: dict) -> tuple[Decimal, Decimal] | None:
+    """原始訊號模式用：取訊號給的 SL1/SL2 價位（優先未被覆蓋的 source_stops）。
+    回 (sl2, sl1)；只有一道止損則 sl2=sl1；訊號沒給止損回 None（交由重算）。"""
+    stops = sorted(signal.get("source_stops") or signal.get("stops") or [],
+                   key=lambda s: s["level"])
+    if not stops:
+        return None
+    sl1 = Decimal(str(stops[0]["price"]))
+    sl2 = Decimal(str(stops[1]["price"])) if len(stops) > 1 else sl1
+    return sl2, sl1
+
+
 def _sl_ladder(signal: dict) -> list[float]:
     """止損階梯（防守→鎖利）：[SL2, SL1, 淨保本, TP1, TP2…]。
-    SL1 = min(訊號SL1距離, 上限 SL1_PCT)；SL2 = SL1 × SL2_MULT。做多往下、做空往上。
+    重算模式：SL1 = min(訊號SL1距離, 上限 SL1_PCT)；SL2 = SL1 × SL2_MULT。做多往下、做空往上。
+    原始訊號模式（RAW_SIGNAL_MODE）：SL1/SL2 直接用訊號給的價位。
     雙軌取相鄰兩階：下軌=rung[tier]、上軌=rung[tier+1]（tier=已成交TP數）。"""
     entry = Decimal(str(signal["entry"]))
-    sl1_pct, sl2_pct = _effective_sl_pcts(signal)
-    p1 = Decimal(str(sl1_pct)) / 100
-    p2 = Decimal(str(sl2_pct)) / 100
-    if TRADE_SIDE == "SHORT":
-        sl2, sl1 = entry * (1 + p2), entry * (1 + p1)             # 做空：止損在上方
+    raw = _raw_signal_stops(signal) if RAW_SIGNAL_MODE else None
+    if raw is not None:
+        sl2, sl1 = raw                                           # 原始訊號：照訊號 SL1/SL2
     else:
-        sl2, sl1 = entry * (1 - p2), entry * (1 - p1)             # 做多：止損在下方
+        sl1_pct, sl2_pct = _effective_sl_pcts(signal)
+        p1 = Decimal(str(sl1_pct)) / 100
+        p2 = Decimal(str(sl2_pct)) / 100
+        if TRADE_SIDE == "SHORT":
+            sl2, sl1 = entry * (1 + p2), entry * (1 + p1)         # 做空：止損在上方
+        else:
+            sl2, sl1 = entry * (1 - p2), entry * (1 - p1)         # 做多：止損在下方
     rungs = [float(sl2), float(sl1), float(_net_breakeven_price(entry))]
     rungs.extend(float(t["price"]) for t in signal["targets"])    # TP1..TPn
     return rungs
@@ -991,10 +1020,15 @@ async def _place_dual_sls(symbol: str, sl_hi: float, sl_lo: float,
             prices.append(float(price))
             print(f"[trader]   SL: {close_side} {qty} @ {price}（reduceOnly {portion}）")
         except BinanceAPIException as e:
-            if e.code != -2021:
-                raise
-            print(f"[trader] ⚠️ {symbol} 止損 {price} 進場時已穿價 → 市價平 {qty}")
-            await _market_close_qty(symbol, close_side, qty)
+            if e.code == -2021:
+                # 進場已穿價 → 市價平該段（不留裸倉）。不記入 prices：該段倉位已了結。
+                print(f"[trader] ⚠️ {symbol} 止損 {price} 進場時已穿價 → 市價平 {qty}")
+                await _market_close_qty(symbol, close_side, qty)
+            else:
+                # 其他掛單失敗：該段交易所 SL 沒掛上，但倉位還在。記下價格交給價格保險絲監控，
+                # 不中斷整筆（否則會留下完全無保護的開倉）。
+                print(f"[trader] ⚠️ {symbol} 止損 {price} 掛單失敗（code={e.code}），改交保險絲監控該段")
+                prices.append(float(price))
     return ids, prices
 
 

@@ -75,9 +75,10 @@ def _matches(text: str) -> bool:
 _QUOTE_CURRENCIES = ("USDT", "USDC", "USD", "BUSD", "FDUSD", "TUSD", "DAI")
 _QUOTE_ALT = "|".join(_QUOTE_CURRENCIES)
 # 交易對符號：基礎幣 + 報價幣（如 VICUSDT、BTCUSDC），前置 # 可有可無
-_SYMBOL_RE = re.compile(rf"#?([A-Z0-9]{{2,15}}(?:{_QUOTE_ALT}))\b")
+# 基礎幣長度下限為 1，支援單字元代號（如 4USDT、XUSDT）
+_SYMBOL_RE = re.compile(rf"#?([A-Z0-9]{{1,15}}(?:{_QUOTE_ALT}))\b")
 # 在文字中找出「還沒加 #」的交易對（負向回顧避免重複加、避免咬到 URL 內部）
-_COIN_RE = re.compile(rf"(?<![#\w])([A-Z0-9]{{2,15}}(?:{_QUOTE_ALT}))\b")
+_COIN_RE = re.compile(rf"(?<![#\w])([A-Z0-9]{{1,15}}(?:{_QUOTE_ALT}))\b")
 
 _SIG_VOL = re.compile(r"成交量排名[：:]\s*(\d+)\w*\s*/\s*(\d+)")
 _SIG_CAP = re.compile(r"市值[：:]\s*([\d.]+[KMB]?)")
@@ -156,6 +157,16 @@ def _our_sl1(signal: dict) -> dict | None:
     except Exception:
         stops = signal.get("stops") or []
         return stops[0] if stops else None
+
+
+def _raw_signal_mode() -> bool:
+    """是否為「原始訊號直通」模式：直接用訊號原始 SL1/SL2＋TP 掛單，不做過濾重算。
+    優先讀交易模組的即時旗標（/config 可切換）；純通知部署無交易模組時退回 .env。"""
+    try:
+        import binance_trader as bt
+        return bt.RAW_SIGNAL_MODE
+    except Exception:
+        return _get("RAW_SIGNAL_MODE", "0") == "1"
 
 
 def format_signal(signal: dict, when: datetime) -> str:
@@ -332,9 +343,11 @@ async def broadcast_via_bot(http: httpx.AsyncClient, text: str,
 
 async def _broadcast_signal(http: httpx.AsyncClient, text: str, signal: dict) -> None:
     """廣播進場訊號，存進 signal_store，並記錄每位收件人的 message_id（供 TP/SL 通知回覆引用）。"""
+    meta = {k: signal[k] for k in ("risk", "volume_rank", "market_cap", "url") if k in signal}
+    if signal.get("source_stops"):
+        meta["source_stops"] = signal["source_stops"]  # 訊號源原始 SL1/SL2（自算 SL1 覆蓋前的備份）
     sig_id = signal_store.add_signal(
-        signal["symbol"], signal["entry"], signal["targets"], signal["stops"],
-        meta={k: signal[k] for k in ("risk", "volume_rank", "market_cap", "url") if k in signal},
+        signal["symbol"], signal["entry"], signal["targets"], signal["stops"], meta=meta,
     )
     sent = await broadcast_via_bot(http, text)
     for cid, mid in sent.items():
@@ -685,6 +698,10 @@ async def _send_config_panel(event) -> None:
     be_desc = "開（TP 成交後止損逐段上移鎖利）" if be_on else "關（止損固定在 SL1 不動）"
     lines.append(f"  動態止損 = {be_desc}")
     buttons.append([Button.inline(f"📈 動態止損：點此{'關閉' if be_on else '開啟'}", b"betog")])
+    raw_on = bt.RAW_SIGNAL_MODE
+    raw_desc = "開（直接用訊號原始 SL1/SL2 掛單）" if raw_on else "關（用過濾重算的 SL 階梯）"
+    lines.append(f"  原始訊號做單 = {raw_desc}")
+    buttons.append([Button.inline(f"📡 原始訊號做單：點此{'關閉' if raw_on else '開啟'}", b"rawtog")])
     auto = "開" if bt.AUTO_MIN_AMOUNT else "關"
     lines.append(f"（環境：{bt.current_network()}｜自動最小金額：{auto}）")
     target = "正式網（真錢）" if bt.TESTNET else "測試網"
@@ -1078,6 +1095,26 @@ async def main() -> None:
             await event.edit(f"✅ 動態止損已{state}\n"
                              "（已寫回 .env；新進場立即生效，已開倉位於下次 TP 成交時依新設定處理）")
 
+        @bot_client.on(events.CallbackQuery(pattern=b"rawtog"))
+        async def _on_raw_toggle(event):
+            """/config 的「原始訊號做單」開關：RAW_SIGNAL_MODE 在 開/關 間切換。
+            開＝直接用訊號原始 SL1/SL2＋TP 掛單；關＝用過濾重算的 SL 階梯（SL1_PCT/SL2_MULT）。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            if trader is None:
+                await event.answer("自動交易未啟用")
+                return
+            import binance_trader as bt
+            new_val = not bt.RAW_SIGNAL_MODE
+            bt.RAW_SIGNAL_MODE = new_val
+            _update_env_file("RAW_SIGNAL_MODE", "1" if new_val else "0")
+            state = ("開啟（直接用訊號原始 SL1/SL2＋TP 掛單）" if new_val
+                     else "關閉（用過濾重算的 SL 階梯）")
+            await event.answer()
+            await event.edit(f"✅ 原始訊號做單已{state}\n"
+                             "（已寫回 .env；下一筆新訊號立即生效，已開倉位不受影響）")
+
     # 設定 bot 指令選單（一般／管理員分流）＋ 訂閱到期背景檢查
     if BOT_TOKEN:
         await setup_bot_commands(http, admin_id)
@@ -1119,9 +1156,13 @@ async def main() -> None:
         now_local = datetime.now(timezone.utc).astimezone()
         signal = parse_signal(text)
         if signal:
-            # 一接收即把停損換成我們算出的單一 SL1（≤SL1_PCT 上限）；之後全程只用這個，不再出現訊號源 SL
-            our_sl1 = _our_sl1(signal)
-            signal["stops"] = [our_sl1] if our_sl1 else []
+            # 覆蓋前先備份訊號源原始 SL1/SL2，存進 DB 的 meta、並供原始訊號模式下單沿用
+            signal["source_stops"] = list(signal.get("stops") or [])
+            if not _raw_signal_mode():
+                # 過濾重算模式：把停損換成我們算出的單一 SL1（≤SL1_PCT 上限）；通知/廣播/下單全程沿用
+                our_sl1 = _our_sl1(signal)
+                signal["stops"] = [our_sl1] if our_sl1 else []
+            # 原始訊號模式：保留訊號原始 SL1/SL2（通知顯示兩道、下單也照訊號掛）
         target_hit = None if signal else parse_target_hit(text)
         stop_hit = None if (signal or target_hit) else parse_stop_hit(text)
         if signal:
@@ -1147,14 +1188,15 @@ async def main() -> None:
             "formatted": formatted,
         }
 
+        # 無條件先存原文：不論解析成功與否都落地，確保收到的每則來源訊息都留底（可事後補規則/稽核）
+        if LOG_TO_FILE:
+            write_log(payload)
+
         if formatted is None:
-            print(f"[略過] {payload['time']} {sender_name}: 解析失敗，不推送")
+            print(f"[略過] {payload['time']} {sender_name}: 解析失敗，已存原文不推送")
             return
 
         print(f"[命中] {payload['time']} {sender_name}: {text[:80]}")
-
-        if LOG_TO_FILE:
-            write_log(payload)
 
         # Bot 廣播、Webhook、自動下單並行觸發，互不等待。
         # 只有「進場訊號」用 Bot 廣播給訂閱者；來源的達標/停損訊息不再轉發 —— 改由行情 WS 自行偵測通知。

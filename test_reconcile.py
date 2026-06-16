@@ -109,8 +109,9 @@ async def scenario_tp1_breakeven():
     t = trades.get(tid)
     check("撤掉剩餘 3 張舊 OCO", len(fake.canceled) == 3)
     check("重掛 3 張新 OCO", len(fake.created) == 3)
-    be = format(bt._quantize(ENTRY, "0.01"), "f")
-    check(f"新 OCO 止損都在保本價 {be}",
+    # 淨保本：止損移到「進場價 + 來回手續費」（_net_breakeven_price），被掃也不虧
+    be = format(bt._quantize(float(bt._net_breakeven_price(Decimal(str(ENTRY)))), "0.01"), "f")
+    check(f"新 OCO 止損都在淨保本價 {be}",
           all(c["belowStopPrice"] == be for c in fake.created))
     check("止盈價維持不變（4 個原始 TP 中的 3 個）",
           {c["abovePrice"] for c in fake.created}
@@ -148,8 +149,8 @@ async def scenario_entry_timeout_cancel():
     fake = bt._client = FakeClient()
     fake.order_status, fake.executed_qty = "NEW", "0"
     bt._filters_cache.clear()
-    old_to, old_poll = bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL
-    bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL = 0.05, 0.02
+    old_to, old_poll = bt.ENTRY_TIMEOUT_MIN, bt.POLL_INTERVAL
+    bt.ENTRY_TIMEOUT_MIN, bt.POLL_INTERVAL = 0.05 / 60, 0.02  # 程式內 *60→秒，故除 60 等效 0.05 秒超時
     try:
         tid = trades.add("BTCUSDT", 63000, 0.0008, 555, {"symbol": "BTCUSDT"})
         await bt._watch_and_protect(tid, initial_status="NEW")
@@ -159,7 +160,7 @@ async def scenario_entry_timeout_cancel():
         check("不再佔 open 額度", t["id"] not in
               {x["id"] for x in trades.list_status("PENDING_BUY") + trades.list_status("ACTIVE")})
     finally:
-        bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL = old_to, old_poll
+        bt.ENTRY_TIMEOUT_MIN, bt.POLL_INTERVAL = old_to, old_poll
 
 
 async def scenario_entry_timeout_partial():
@@ -167,8 +168,8 @@ async def scenario_entry_timeout_partial():
     fake = bt._client = FakeClient()
     fake.order_status, fake.executed_qty = "PARTIALLY_FILLED", "0.00050"
     bt._filters_cache.clear()
-    old_to, old_poll = bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL
-    bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL = 0.05, 0.02
+    old_to, old_poll = bt.ENTRY_TIMEOUT_MIN, bt.POLL_INTERVAL
+    bt.ENTRY_TIMEOUT_MIN, bt.POLL_INTERVAL = 0.05 / 60, 0.02  # 程式內 *60→秒，故除 60 等效 0.05 秒超時
     try:
         sig = {"symbol": "BTCUSDT", "entry": 63000,
                "targets": [{"level": i + 1, "price": 63000 * (1 + 0.01 * (i + 1)), "pct": 0}
@@ -182,7 +183,7 @@ async def scenario_entry_timeout_partial():
         check("已掛 OCO 保護部分倉位", len(fake.created) >= 1)
         check("交易進入 ACTIVE", t["status"] == "ACTIVE")
     finally:
-        bt.ENTRY_TIMEOUT_SEC, bt.POLL_INTERVAL = old_to, old_poll
+        bt.ENTRY_TIMEOUT_MIN, bt.POLL_INTERVAL = old_to, old_poll
 
 
 async def main():
