@@ -15,3 +15,15 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# 回測/分析的歷史資料與產出（大檔、可由腳本重新產生，不入版控）
+btc_1h.json
+dca_data.json
+dca_series.json
+macd_grid.json
+
+# 訊號樣本暫存
+signal*.txt
+
+# macOS
+.DS_Store
