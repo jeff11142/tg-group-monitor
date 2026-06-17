@@ -169,6 +169,20 @@ def _raw_signal_mode() -> bool:
         return _get("RAW_SIGNAL_MODE", "0") == "1"
 
 
+def _make_admin_notifier(http: "httpx.AsyncClient", admin_id: int | None):
+    """產生交易事件通知函式（注入 binance_trader）：寫入 log 留底 + 私訊管理員。
+    僅發給管理員（這是操作者自己帳號的倉位管理事件，不廣播給訂閱者）。"""
+    async def _notify(text: str) -> None:
+        now = datetime.now(timezone.utc).astimezone()
+        if LOG_TO_FILE:
+            write_log({"time": now.isoformat(), "type": "trade_event", "text": text})
+        if admin_id:
+            await send_bot_dm(http, admin_id, text)
+        else:
+            print("[trade-notify] 未設 ADMIN_CHAT_ID，僅 log 不私訊")
+    return _notify
+
+
 def format_signal(signal: dict, when: datetime) -> str:
     """把結構化訊號格式化成自訂版面。"""
     lines = [
@@ -544,6 +558,7 @@ TUNABLE_PARAMS = {
     "min_amount_mult":   ("MIN_AMOUNT_MULT",   "MIN_AMOUNT_MULT",   float, _v_positive),
     "max_open_trades":   ("MAX_OPEN_TRADES",   "MAX_OPEN_TRADES",   int,   _v_max_open),
     "entry_timeout_min": ("ENTRY_TIMEOUT_MIN", "ENTRY_TIMEOUT_MIN", float, _v_nonneg),
+    "max_hold_hours":    ("MAX_HOLD_HOURS",    "MAX_HOLD_HOURS",    float, _v_nonneg),
 }
 
 _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -1126,6 +1141,7 @@ async def main() -> None:
     if TRADING_ENABLED:
         import binance_trader as trader
         trader.init()
+        trader.set_notifier(_make_admin_notifier(http, admin_id))  # 交易事件 → 私訊管理員
         await trader.resume()
         trader.start_monitor()
         await trader.start_user_stream()

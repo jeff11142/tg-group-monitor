@@ -16,6 +16,7 @@
 import asyncio
 import os
 import time
+from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 
 from binance import AsyncClient, BinanceSocketManager
@@ -74,6 +75,8 @@ RAW_SIGNAL_MODE = _get("RAW_SIGNAL_MODE", "0") == "1"
 SL_MULTIPLIER = float(_get("SL_MULTIPLIER", "2"))
 # 限價買單超過幾分鐘未成交就撤單、釋放持倉額度（0=永不超時，一直等成交）
 ENTRY_TIMEOUT_MIN = float(_get("ENTRY_TIMEOUT_MIN", "30"))
+# 持倉超過幾小時仍未觸發 TP/SL 就主動市價平倉、釋放名額（0=不限，一直持有）
+MAX_HOLD_HOURS = float(_get("MAX_HOLD_HOURS", "24"))
 # 合約模式（USDT-M 永續）：1=合約 0=現貨
 FUTURES = _get("BINANCE_FUTURES", "0") == "1"
 LEVERAGE = int(_get("LEVERAGE", "1"))
@@ -117,6 +120,87 @@ def _spawn(coro) -> None:
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
+
+
+# 交易事件通知：由 main.py 注入（私訊管理員）。未注入（如單元測試/純通知部署）則靜默。
+_notifier = None
+
+
+def set_notifier(fn) -> None:
+    """注入交易事件通知函式 async def fn(text: str)。由 main.py 在啟動交易時提供。"""
+    global _notifier
+    _notifier = fn
+
+
+async def _notify(text: str) -> None:
+    """發送交易事件通知（若有注入 notifier）；發送失敗只記 log，不影響交易流程。"""
+    if _notifier is None:
+        return
+    try:
+        await _notifier(text)
+    except Exception as e:
+        print(f"[trader] 交易事件通知發送失敗：{e!r}")
+
+
+def _position_age_hours(trade: dict) -> float | None:
+    """持倉自建檔（created_at）以來的小時數；無法解析回 None。"""
+    ts = trade.get("created_at")
+    if not ts:
+        return None
+    try:
+        created = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - created).total_seconds() / 3600
+
+
+def _pnl(entry: float, exit_price: float, qty: float) -> tuple[float, float, float]:
+    """估算平倉盈虧，回 (USDT 盈虧, 價格變動%, 報酬率% 含槓桿)。做空反向；未計手續費。"""
+    direction = -1 if TRADE_SIDE == "SHORT" else 1
+    move_pct = (exit_price - entry) / entry * 100 * direction if entry else 0.0
+    pnl_usdt = (exit_price - entry) * qty * direction
+    return pnl_usdt, move_pct, move_pct * LEVERAGE
+
+
+def _trade_start_ms(trade: dict) -> int | None:
+    """trade 建檔時間（created_at）轉成毫秒 epoch；無法解析回 None。"""
+    ts = trade.get("created_at")
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+async def _fetch_realized_pnl(symbol: str, start_ms: int, close_ms: int) -> dict | None:
+    """平倉後回查 Binance income history，取本筆真實損益（含手續費、資金費，皆為 USDT 計）。
+    回 {pnl, realized, commission, funding}；平倉損益尚未入帳（延遲/測試網不支援）回 None → 由呼叫端退回估算。
+    同幣同時只一筆未結倉（has_open_symbol），故 startTime 之後的 income 即本筆。"""
+    for attempt in range(4):
+        try:
+            rows = await _api(_client.futures_income_history,
+                              symbol=symbol, startTime=start_ms, limit=1000) or []
+        except Exception as e:
+            print(f"[trader] 查 income history 失敗：{e!r}")
+            return None
+        # 確認「平倉那筆的已實現損益」已入帳（time ≥ 平倉時間），避免抓到尚未結算的不完整數字
+        if any(r.get("incomeType") == "REALIZED_PNL" and int(r.get("time", 0)) >= close_ms
+               for r in rows):
+            def _sum(kind):  # income 已帶正負號（手續費/付出的資金費為負）
+                return sum(float(r["income"]) for r in rows if r.get("incomeType") == kind)
+            realized, commission, funding = _sum("REALIZED_PNL"), _sum("COMMISSION"), _sum("FUNDING_FEE")
+            return {"pnl": realized + commission + funding, "realized": realized,
+                    "commission": commission, "funding": funding}
+        if attempt < 3:
+            await asyncio.sleep(1.5)  # 已實現損益入帳有短暫延遲，稍候重查
+    print(f"[trader] {symbol} 平倉損益 income 尚未入帳，改用估算")
+    return None
 
 
 def init() -> None:
@@ -807,6 +891,13 @@ async def _reconcile_futures(trade: dict, snap: dict | None = None) -> None:
         print(f"[trader] trade#{trade['id']} {symbol} 倉位已平 → CLOSED（釋放持倉額度）")
         return
 
+    # #1.5 持倉超時：超過 MAX_HOLD_HOURS 仍未觸發 TP/SL → 主動市價平倉、釋放名額、通知管理員
+    if MAX_HOLD_HOURS > 0:
+        age_h = _position_age_hours(trade)
+        if age_h is not None and age_h >= MAX_HOLD_HOURS:
+            await _close_stale_futures(trade, amt, age_h)
+            return
+
     # 取一次現價供保險絲判斷。相容舊版單張 sl_price
     sl_prices = info.get("sl_prices") or ([info["sl_price"]] if info.get("sl_price") else [])
     need_price = (SL_FAILSAFE and sl_prices) or (TP_FAILSAFE and info.get("tp_orders"))
@@ -912,6 +1003,67 @@ async def _force_close_futures(trade: dict, amt: float, price: float, sl_price: 
     await _cancel_all_futures_orders(symbol)
     trades.set_status(trade["id"], "CLOSED")
     print(f"[trader] trade#{trade['id']} {symbol} 保險絲已平倉 → CLOSED")
+
+
+async def _close_stale_futures(trade: dict, amt: float, age_h: float) -> None:
+    """持倉超過 MAX_HOLD_HOURS 仍未觸發 TP/SL：主動市價全平、撤殘留單、標 CLOSED，並通知管理員（含真實盈虧）。"""
+    symbol = trade["symbol"]
+    _, close_side = _sides()
+    filt = await _get_filters(symbol)
+    qty = _quantize(amt, filt["step"])
+    # 真實進場均價（供報酬率/顯示）；取不到退回記錄的進場價
+    try:
+        pos = await _api(_client.futures_position_information, symbol=symbol)
+        real_entry = float(pos[0].get("entryPrice") or trade["entry"]) if pos else float(trade["entry"])
+    except Exception:
+        real_entry = float(trade["entry"])
+    # 平倉前現價（僅供訊息顯示「進場→平倉」參考）
+    try:
+        ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
+        exit_price = float(ticker.get("price") or real_entry)
+    except Exception:
+        exit_price = real_entry
+    print(f"[trader] ⏰ trade#{trade['id']} {symbol} 持倉 {age_h:.1f}h ≥ 上限 {MAX_HOLD_HOURS:g}h，"
+          f"未觸發 TP/SL → 市價平倉 {qty}")
+    try:
+        await _api(_client.futures_create_order, symbol=symbol, side=close_side,
+                   type="MARKET", quantity=format(qty, "f"), reduceOnly="true")
+    except BinanceAPIException as e:
+        if e.code != -2022:  # -2022 ReduceOnly 被拒：倉位剛好已平，下輪對帳會收單
+            print(f"[trader] 超時平倉失敗：{e.status_code} {e.message}")
+        return
+    await _cancel_all_futures_orders(symbol)
+    trades.set_status(trade["id"], "CLOSED")
+
+    # 回查 Binance 真實損益（含手續費、資金費）；查不到才退回估算
+    start_ms = _trade_start_ms(trade)
+    close_ms = int(time.time() * 1000)
+    real = await _fetch_realized_pnl(symbol, start_ms, close_ms) if start_ms else None
+    margin = real_entry * float(amt) / LEVERAGE if (real_entry and LEVERAGE) else 0.0
+    if real is not None:
+        net = real["pnl"]
+        roe = (net / margin * 100) if margin else 0.0
+        emoji, sign = ("📈", "+") if net >= 0 else ("📉", "")
+        pnl_line = (
+            f"{emoji} 已實現盈虧：{sign}{net:.2f} USDT（報酬率 {sign}{roe:.2f}%，含 {LEVERAGE:g}x 槓桿）\n"
+            f"  └ 價差損益 {real['realized']:+.2f}｜手續費 {real['commission']:+.2f}"
+            f"｜資金費 {real['funding']:+.2f} USDT"
+        )
+        log_pnl = f"{sign}{net:.2f} USDT / {sign}{roe:.2f}%（真實，含費）"
+    else:
+        pnl_usdt, _, roe_pct = _pnl(real_entry, exit_price, float(amt))
+        emoji, sign = ("📈", "+") if pnl_usdt >= 0 else ("📉", "")
+        pnl_line = (f"{emoji} 盈虧：約 {sign}{pnl_usdt:.2f} USDT"
+                    f"（報酬率 {sign}{roe_pct:.2f}%，含 {LEVERAGE:g}x 槓桿；估算、未含手續費）")
+        log_pnl = f"約 {sign}{pnl_usdt:.2f} USDT（估算）"
+    print(f"[trader] trade#{trade['id']} {symbol} 超時已平倉 → CLOSED（{log_pnl}，釋放持倉額度）")
+    await _notify(
+        f"⏰ 超時平倉\n"
+        f"幣別：{symbol}\n"
+        f"進場：{real_entry:g} → 平倉：{exit_price:g}\n"
+        f"持倉 {age_h:.1f} 小時（上限 {MAX_HOLD_HOURS:g}h）未觸發 TP/SL，已市價平倉並釋放名額。\n"
+        f"{pnl_line}"
+    )
 
 
 async def _cancel_conditional(symbol: str, order_id) -> None:

@@ -9,7 +9,9 @@
 """
 
 import asyncio
+import sqlite3
 import tempfile
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import trades
@@ -37,6 +39,8 @@ class FakeFuturesClient:
         self.executed_qty = "0"
         self.open_conditional = []  # 還掛著的條件單（TP/SL）
         self.stop_error = None      # 設成 error code → 掛 STOP_MARKET 時丟該錯
+        self.entry_price = "100"    # 倉位真實進場均價（供超時平倉算報酬率）
+        self.income_rows = []       # futures_income_history 回傳的 income 列（測真實損益用）
         self._oid = 7000
 
     def futures_exchange_info(self):
@@ -74,7 +78,11 @@ class FakeFuturesClient:
         return {"status": self.order_status, "executedQty": self.executed_qty, "orderId": orderId}
 
     def futures_position_information(self, symbol):
-        return [{"symbol": symbol, "positionAmt": self.position_amt}]
+        return [{"symbol": symbol, "positionAmt": self.position_amt,
+                 "entryPrice": self.entry_price}]
+
+    def futures_income_history(self, symbol=None, **kw):
+        return list(self.income_rows)
 
     def futures_get_open_orders(self, symbol, conditional=False):
         return list(self.open_conditional) if conditional else []
@@ -317,6 +325,68 @@ async def scenario_raw_signal_mode():
         bt.RAW_SIGNAL_MODE = False
 
 
+async def scenario_max_hold_timeout():
+    print("\n[合約-12] 持倉超過 MAX_HOLD_HOURS 未觸發 TP/SL → 市價平倉 + 通知管理員")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="103")  # 平倉現價（顯示用）
+    fake.entry_price = "100"
+    # Binance 真實 income：已實現 +0.90、手續費 -0.05、資金費 -0.02 → 淨 +0.83 USDT
+    fake.income_rows = [
+        {"incomeType": "REALIZED_PNL", "income": "0.90", "time": 9_999_999_999_999},
+        {"incomeType": "COMMISSION", "income": "-0.05", "time": 9_999_999_999_999},
+        {"incomeType": "FUNDING_FEE", "income": "-0.02", "time": 9_999_999_999_999},
+    ]
+    bt._filters_cache.clear()
+    bt.MAX_HOLD_HOURS = 24
+    notified = []
+
+    async def _cap(text):
+        notified.append(text)
+
+    bt.set_notifier(_cap)
+    # 建一筆 ACTIVE 倉（進場 100、量 0.3），並把 created_at 倒退 100 小時（超過 24h 上限）
+    tid = trades.add("BTCUSDT", 100.0, 0.3, 999, SIGNAL)
+    trades.set_status(tid, "ACTIVE")
+    fake.position_amt = "0.3"
+    old = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
+    conn = sqlite3.connect(trades.DB_FILE)
+    conn.execute("UPDATE trades SET created_at = ? WHERE id = ?", (old, tid))
+    conn.commit()
+    conn.close()
+    try:
+        await bt._reconcile(trades.get(tid))
+        closes = [c for c in fake.created
+                  if c.get("type") == "MARKET" and c.get("reduceOnly") == "true"]
+        check("市價平倉（SELL reduceOnly 全平）", len(closes) == 1 and closes[0]["side"] == "SELL")
+        check("交易標記 CLOSED（釋放名額）", trades.get(tid)["status"] == "CLOSED")
+        check("撤掉殘留條件單", fake.cancel_all_count >= 1)
+        msg = notified[0] if notified else ""
+        check("有發出超時平倉通知給管理員", "超時平倉" in msg)
+        # 真實淨損益 = 0.90 − 0.05 − 0.02 = +0.83 USDT
+        check("通知含真實淨損益（+0.83 USDT）", "+0.83 USDT" in msg)
+        # 報酬率 = 0.83 / (100×0.3 / 1) = 2.77%
+        check("通知含報酬率（+2.77%）", "+2.77%" in msg)
+        check("通知含手續費/資金費明細", "手續費 -0.05" in msg and "資金費 -0.02" in msg)
+    finally:
+        bt.set_notifier(None)
+
+
+async def scenario_max_hold_not_expired():
+    print("\n[合約-13] 持倉未超時（新倉）→ 不平倉、維持 ACTIVE")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="100")
+    bt._filters_cache.clear()
+    bt.MAX_HOLD_HOURS = 24
+    tid = trades.add("BTCUSDT", 100.0, 0.3, 999, SIGNAL)  # created_at = 現在（倉齡 ~0）
+    trades.set_status(tid, "ACTIVE")
+    fake.position_amt = "0.3"
+    await bt._reconcile(trades.get(tid))
+    check("沒有市價平倉", not any(c.get("type") == "MARKET" for c in fake.created))
+    check("維持 ACTIVE", trades.get(tid)["status"] == "ACTIVE")
+
+
 async def main():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
@@ -338,6 +408,8 @@ async def main():
     await scenario_no_position_on_protect()
     await scenario_sl_place_fail_failsafe()
     await scenario_raw_signal_mode()
+    await scenario_max_hold_timeout()
+    await scenario_max_hold_not_expired()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 
