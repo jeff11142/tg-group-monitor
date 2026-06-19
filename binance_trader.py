@@ -16,7 +16,8 @@
 import asyncio
 import os
 import time
-from datetime import datetime, timezone
+from datetime import date as _date
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 
 from binance import AsyncClient, BinanceSocketManager
@@ -201,6 +202,69 @@ async def _fetch_realized_pnl(symbol: str, start_ms: int, close_ms: int) -> dict
             await asyncio.sleep(1.5)  # 已實現損益入帳有短暫延遲，稍候重查
     print(f"[trader] {symbol} 平倉損益 income 尚未入帳，改用估算")
     return None
+
+
+def _local_day_bounds(d: _date) -> tuple[int, int]:
+    """把「本地時區某一天」轉成 [00:00, 隔日00:00) 的毫秒 epoch 區間。"""
+    local_tz = datetime.now(timezone.utc).astimezone().tzinfo
+    start = datetime(d.year, d.month, d.day, tzinfo=local_tz)
+    end = start + timedelta(days=1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
+async def daily_pnl(d: _date | None = None) -> dict:
+    """直接向 Binance 帳戶撈某一天（本地時區）實際成交的合約損益，依交易對彙總。
+
+    用 income history 的 REALIZED_PNL（價差）＋ COMMISSION（手續費）＋ FUNDING_FEE（資金費），
+    income 欄位本身已帶正負號。回：
+      {date, net_total, realized, commission, funding,
+       symbols: [{symbol, net, realized, commission, funding} ...]（按 net 由大到小）,
+       winners, losers, testnet}
+    撈不到任何 income → symbols 為空、各項為 0。"""
+    if d is None:
+        d = datetime.now(timezone.utc).astimezone().date()
+    start_ms, end_ms = _local_day_bounds(d)
+
+    rows: list[dict] = []
+    cursor = start_ms
+    for _ in range(20):  # 上限 20 頁（2 萬筆）足夠單日；避免理論上無限迴圈
+        page = await _api(_client.futures_income_history,
+                          startTime=cursor, endTime=end_ms, limit=1000) or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        cursor = max(int(r.get("time", 0)) for r in page) + 1  # 下一頁從最後一筆的下一毫秒接續
+
+    by_symbol: dict[str, dict] = {}
+    kinds = ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE")
+    for r in rows:
+        kind = r.get("incomeType")
+        if kind not in kinds:
+            continue
+        sym = r.get("symbol") or "—"
+        acc = by_symbol.setdefault(
+            sym, {"symbol": sym, "realized": 0.0, "commission": 0.0, "funding": 0.0})
+        key = {"REALIZED_PNL": "realized", "COMMISSION": "commission",
+               "FUNDING_FEE": "funding"}[kind]
+        acc[key] += float(r.get("income", 0) or 0)
+
+    symbols = []
+    for acc in by_symbol.values():
+        acc["net"] = acc["realized"] + acc["commission"] + acc["funding"]
+        symbols.append(acc)
+    symbols.sort(key=lambda s: s["net"], reverse=True)
+
+    return {
+        "date": d.isoformat(),
+        "net_total": sum(s["net"] for s in symbols),
+        "realized": sum(s["realized"] for s in symbols),
+        "commission": sum(s["commission"] for s in symbols),
+        "funding": sum(s["funding"] for s in symbols),
+        "symbols": symbols,
+        "winners": [s for s in symbols if s["net"] > 0],
+        "losers": [s for s in symbols if s["net"] < 0],
+        "testnet": TESTNET,
+    }
 
 
 def init() -> None:

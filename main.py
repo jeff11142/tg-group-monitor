@@ -10,7 +10,8 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date as _date
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -313,6 +314,7 @@ ADMIN_COMMANDS = [
     {"command": "disable", "description": "暫停接收者"},
     {"command": "list", "description": "列出所有接收者"},
     {"command": "config", "description": "查看或調整交易參數"},
+    {"command": "pnl", "description": "查某天實際損益（可帶日期 YYYY-MM-DD）"},
     {"command": "myid", "description": "顯示你的編號"},
     {"command": "help", "description": "顯示管理說明"},
 ]
@@ -482,6 +484,7 @@ ADMIN_HELP_TEXT = (
     "/enable — 啟用接收者\n"
     "/disable — 暫停接收者\n"
     "/config — 查看或調整交易參數\n"
+    "/pnl — 查某天實際損益（預設今天，可帶日期：/pnl 2026-06-18）\n"
     "/cancel — 取消進行中的操作\n"
     "/myid — 顯示你的編號\n"
     "/help — 顯示此說明"
@@ -725,12 +728,80 @@ async def _send_config_panel(event) -> None:
     await event.respond("\n".join(lines), buttons=buttons)
 
 
+def _parse_pnl_date(arg: str | None) -> _date | None:
+    """解析 /pnl 的日期參數：支援 YYYY-MM-DD、today/今天、yesterday/昨天；省略=今天。
+    無法解析回 None。"""
+    today = datetime.now(timezone.utc).astimezone().date()
+    if not arg or arg.lower() in ("today", "今天"):
+        return today
+    if arg.lower() in ("yesterday", "昨天"):
+        return today - timedelta(days=1)
+    try:
+        return datetime.strptime(arg.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _format_daily_pnl(data: dict) -> str:
+    net = data["net_total"]
+    head_emoji = "📈" if net > 0 else ("📉" if net < 0 else "➖")
+    net_sign = "+" if net >= 0 else ""
+    net_label = "正式網" if not data["testnet"] else "測試網"
+    lines = [f"{head_emoji} {data['date']} 實際損益（{net_label}）"]
+
+    if not data["symbols"]:
+        lines.append("這天沒有任何已結算的成交損益。")
+        return "\n".join(lines)
+
+    def _row(s: dict) -> str:
+        sign = "+" if s["net"] >= 0 else ""
+        return (f"• {s['symbol']}：{sign}{s['net']:.2f} USDT"
+                f"（價差 {s['realized']:+.2f}｜費 {s['commission'] + s['funding']:+.2f}）")
+
+    if data["winners"]:
+        lines.append(f"\n獲利 {len(data['winners'])} 筆：")
+        lines.extend(_row(s) for s in data["winners"])
+    if data["losers"]:
+        lines.append(f"\n虧損 {len(data['losers'])} 筆：")
+        lines.extend(_row(s) for s in data["losers"])
+
+    lines.append(
+        f"\n━━━━━━━━━━\n"
+        f"當日合計：{net_sign}{net:.2f} USDT\n"
+        f"  └ 價差 {data['realized']:+.2f}｜手續費 {data['commission']:+.2f}"
+        f"｜資金費 {data['funding']:+.2f} USDT"
+    )
+    return "\n".join(lines)
+
+
+async def _handle_pnl(event, arg: str | None) -> None:
+    if not TRADING_ENABLED:
+        await event.reply("交易模組未啟用（TRADING_ENABLED=0），無法查 Binance 帳戶損益。")
+        return
+    d = _parse_pnl_date(arg)
+    if d is None:
+        await event.reply(f"日期格式看不懂：{arg!r}\n請用 YYYY-MM-DD，例如 /pnl 2026-06-18，"
+                          "或 /pnl（今天）、/pnl 昨天。")
+        return
+    try:
+        import binance_trader as bt
+        data = await bt.daily_pnl(d)
+    except Exception as e:
+        await event.reply(f"查詢失敗：{e}")
+        return
+    await event.reply(_format_daily_pnl(data))
+
+
 async def _handle_admin_command(event, text: str) -> None:
     parts = text.split(None, 2)  # 切最多 3 段：cmd, arg1, rest
     cmd = parts[0].lower()
 
     if cmd == "/config":
         await _send_config_panel(event)
+        return
+
+    if cmd == "/pnl":
+        await _handle_pnl(event, parts[1] if len(parts) > 1 else None)
         return
 
     if cmd == "/list":
