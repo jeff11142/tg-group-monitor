@@ -44,6 +44,8 @@ LOG_TO_FILE = _get("LOG_TO_FILE", "1") == "1"
 LOG_FILE = _get("LOG_FILE", "messages.jsonl")
 LIST_DIALOGS = _get("LIST_DIALOGS", "0") == "1"
 TRADING_ENABLED = _get("TRADING_ENABLED", "0") == "1"
+# /pnl 區分手動／量化交易的保證金分界：保證金 > 此值＝手動，≤ 此值＝量化（bot 固定小本金）
+PNL_MANUAL_MARGIN = float(_get("PNL_MANUAL_MARGIN", "100"))
 # 訂閱服務（USDT 付款，管理員手動確認後 /sub 開通）
 SUB_PRICE_USDT = _get("SUB_PRICE_USDT", "30")
 SUB_DAYS = _get("SUB_DAYS", "30")
@@ -314,7 +316,7 @@ ADMIN_COMMANDS = [
     {"command": "disable", "description": "暫停接收者"},
     {"command": "list", "description": "列出所有接收者"},
     {"command": "config", "description": "查看或調整交易參數"},
-    {"command": "pnl", "description": "查某天實際損益（可帶日期 YYYY-MM-DD）"},
+    {"command": "pnl", "description": "查某天實際損益（選手動／量化交易）"},
     {"command": "myid", "description": "顯示你的編號"},
     {"command": "help", "description": "顯示管理說明"},
 ]
@@ -484,7 +486,7 @@ ADMIN_HELP_TEXT = (
     "/enable — 啟用接收者\n"
     "/disable — 暫停接收者\n"
     "/config — 查看或調整交易參數\n"
-    "/pnl — 查某天實際損益（預設今天，可帶日期：/pnl 2026-06-18）\n"
+    "/pnl — 查某天實際損益（點擊後選手動／量化交易 → 選日期，含今日／昨日快捷）\n"
     "/cancel — 取消進行中的操作\n"
     "/myid — 顯示你的編號\n"
     "/help — 顯示此說明"
@@ -742,21 +744,54 @@ def _parse_pnl_date(arg: str | None) -> _date | None:
         return None
 
 
+# /pnl 交易類型：(顯示標籤, min_margin, max_margin)。手動=保證金>門檻；量化=保證金≤門檻
+_PNL_MODE = {
+    "manual": (f"💹 手動交易（保證金 > {PNL_MANUAL_MARGIN:g} USDT）", PNL_MANUAL_MARGIN, None),
+    "quant": (f"🤖 量化交易（保證金 ≤ {PNL_MANUAL_MARGIN:g} USDT）", None, PNL_MANUAL_MARGIN),
+}
+
+
+def _pnl_mode_buttons() -> list:
+    return [
+        [Button.inline("💹 手動交易", b"pnl:manual"),
+         Button.inline("🤖 量化交易", b"pnl:quant")],
+        _cancel_row(),
+    ]
+
+
+def _pnl_date_buttons(mode: str) -> list:
+    return [
+        [Button.inline("今日", f"pnld:{mode}:today".encode()),
+         Button.inline("昨日", f"pnld:{mode}:yesterday".encode())],
+        _cancel_row(),
+    ]
+
+
 def _format_daily_pnl(data: dict) -> str:
     net = data["net_total"]
     head_emoji = "📈" if net > 0 else ("📉" if net < 0 else "➖")
     net_sign = "+" if net >= 0 else ""
     net_label = "正式網" if not data["testnet"] else "測試網"
-    lines = [f"{head_emoji} {data['date']} 實際損益（{net_label}）"]
+    filtered = data.get("min_margin") is not None or data.get("max_margin") is not None
+    head = f"{head_emoji} {data['date']} 實際損益（{net_label}）"
+    if data.get("mode_label"):
+        head += f"\n{data['mode_label']}"
+    elif data.get("min_margin") is not None:
+        head += f"\n🔎 只計保證金 > {data['min_margin']:g} USDT 的交易對"
+    elif data.get("max_margin") is not None:
+        head += f"\n🔎 只計保證金 ≤ {data['max_margin']:g} USDT 的交易對"
+    lines = [head]
 
     if not data["symbols"]:
-        lines.append("這天沒有任何已結算的成交損益。")
+        lines.append("這天沒有符合條件的已結算交易對。" if filtered
+                     else "這天沒有任何已結算的成交損益。")
         return "\n".join(lines)
 
     def _row(s: dict) -> str:
         sign = "+" if s["net"] >= 0 else ""
+        margin_txt = f"｜保證金 {s['margin']:.0f}" if "margin" in s else ""
         return (f"• {s['symbol']}：{sign}{s['net']:.2f} USDT"
-                f"（價差 {s['realized']:+.2f}｜費 {s['commission'] + s['funding']:+.2f}）")
+                f"（價差 {s['realized']:+.2f}｜費 {s['commission'] + s['funding']:+.2f}{margin_txt}）")
 
     if data["winners"]:
         lines.append(f"\n獲利 {len(data['winners'])} 筆：")
@@ -774,22 +809,25 @@ def _format_daily_pnl(data: dict) -> str:
     return "\n".join(lines)
 
 
-async def _handle_pnl(event, arg: str | None) -> None:
+async def _run_pnl(event, mode: str, d: _date, edit: bool = False) -> None:
+    """依交易類型（手動/量化）查某日損益並回覆。edit=True 用於 callback（直接改原訊息、收掉按鈕）。"""
+    reply = event.edit if edit else event.reply
+    label, min_m, max_m = _PNL_MODE[mode]
+    try:
+        import binance_trader as bt
+        data = await bt.daily_pnl(d, min_margin=min_m, max_margin=max_m)
+    except Exception as e:
+        await reply(f"查詢失敗：{e}")
+        return
+    data["mode_label"] = label
+    await reply(_format_daily_pnl(data))
+
+
+async def _handle_pnl(event) -> None:
     if not TRADING_ENABLED:
         await event.reply("交易模組未啟用（TRADING_ENABLED=0），無法查 Binance 帳戶損益。")
         return
-    d = _parse_pnl_date(arg)
-    if d is None:
-        await event.reply(f"日期格式看不懂：{arg!r}\n請用 YYYY-MM-DD，例如 /pnl 2026-06-18，"
-                          "或 /pnl（今天）、/pnl 昨天。")
-        return
-    try:
-        import binance_trader as bt
-        data = await bt.daily_pnl(d)
-    except Exception as e:
-        await event.reply(f"查詢失敗：{e}")
-        return
-    await event.reply(_format_daily_pnl(data))
+    await event.reply("📊 查詢實際損益\n請選擇交易類型：", buttons=_pnl_mode_buttons())
 
 
 async def _handle_admin_command(event, text: str) -> None:
@@ -801,7 +839,7 @@ async def _handle_admin_command(event, text: str) -> None:
         return
 
     if cmd == "/pnl":
-        await _handle_pnl(event, parts[1] if len(parts) > 1 else None)
+        await _handle_pnl(event)
         return
 
     if cmd == "/list":
@@ -995,6 +1033,13 @@ async def main() -> None:
                     if ok:
                         _pending.pop(sender, None)
                     await event.reply(msg)
+                elif kind == "pnldate":  # 等待 /pnl 輸入日期；key=交易類型 manual/quant
+                    d = _parse_pnl_date(text.strip())
+                    if d is None:
+                        await event.reply("日期格式看不懂，請用 YYYY-MM-DD（或點今日／昨日）。")
+                        return  # 保留等待狀態，讓使用者重打
+                    _pending.pop(sender, None)
+                    await _run_pnl(event, key, d)
                 else:  # "cmd"：把輸入接到指令後面，交給原指令邏輯
                     _pending.pop(sender, None)
                     await _handle_admin_command(event, f"/{key} {text.strip()}")
@@ -1037,6 +1082,46 @@ async def main() -> None:
                 f"請直接輸入新值（{_type_label(conv)}）。",
                 buttons=[_cancel_row()],
             )
+
+        @bot_client.on(events.CallbackQuery(pattern=b"pnl:"))
+        async def _on_pnl_mode(event):
+            """/pnl 第一步：選手動／量化交易，接著請使用者選或輸入日期。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            await event.answer()
+            if trader is None:
+                await event.edit("交易模組未啟用，無法查 Binance 帳戶損益。")
+                return
+            mode = event.data.decode().split(":", 1)[1]
+            if mode not in _PNL_MODE:
+                await event.edit("未知選項。")
+                return
+            _pending[event.sender_id] = ("pnldate", mode)
+            await event.edit(
+                f"{_PNL_MODE[mode][0]}\n請輸入日期（YYYY-MM-DD），或點下方快捷：",
+                buttons=_pnl_date_buttons(mode),
+            )
+
+        @bot_client.on(events.CallbackQuery(pattern=b"pnld:"))
+        async def _on_pnl_date(event):
+            """/pnl 第二步：今日／昨日快捷按鈕。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            try:
+                _, mode, when = event.data.decode().split(":", 2)
+            except (ValueError, UnicodeDecodeError):
+                await event.answer("資料格式錯誤")
+                return
+            if mode not in _PNL_MODE:
+                await event.answer("未知選項")
+                return
+            d = _parse_pnl_date("昨天" if when == "yesterday" else "今天")
+            _pending.pop(event.sender_id, None)
+            await event.answer()
+            await event.edit(f"查詢中…（{_PNL_MODE[mode][0]} ／ {d.isoformat()}）")
+            await _run_pnl(event, mode, d, edit=True)
 
         @bot_client.on(events.CallbackQuery(pattern=b"act:"))
         async def _on_action_button(event):

@@ -212,13 +212,29 @@ def _local_day_bounds(d: _date) -> tuple[int, int]:
     return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
-async def daily_pnl(d: _date | None = None) -> dict:
+async def _entry_margin(symbol: str, start_ms: int, end_ms: int) -> float:
+    """該日該幣的「投入保證金」估算（USDT）= 進場名目 ÷ 槓桿。
+    進場名目 = 開倉成交的 quoteQty 加總（開倉腿 realizedPnl==0；平倉腿才帶損益）。
+    bot 對每個幣統一設 LEVERAGE，故用 LEVERAGE 當除數。"""
+    fills = await _api(_client.futures_account_trades,
+                       symbol=symbol, startTime=start_ms, endTime=end_ms, limit=1000) or []
+    notional = sum(
+        float(t.get("quoteQty") or float(t["price"]) * float(t["qty"]))
+        for t in fills if float(t.get("realizedPnl", 0) or 0) == 0.0
+    )
+    return notional / LEVERAGE if LEVERAGE else notional
+
+
+async def daily_pnl(d: _date | None = None, min_margin: float | None = None,
+                    max_margin: float | None = None) -> dict:
     """直接向 Binance 帳戶撈某一天（本地時區）實際成交的合約損益，依交易對彙總。
 
     用 income history 的 REALIZED_PNL（價差）＋ COMMISSION（手續費）＋ FUNDING_FEE（資金費），
-    income 欄位本身已帶正負號。回：
-      {date, net_total, realized, commission, funding,
-       symbols: [{symbol, net, realized, commission, funding} ...]（按 net 由大到小）,
+    income 欄位本身已帶正負號。min_margin／max_margin 給值時依「投入保證金」過濾交易對
+    （min_margin → 保證金 > 門檻；max_margin → 保證金 ≤ 門檻），並據此重算加總
+    （需額外撈成交明細，故僅在有門檻時才查）。回：
+      {date, net_total, realized, commission, funding, min_margin, max_margin,
+       symbols: [{symbol, net, realized, commission, funding, margin?} ...]（按 net 由大到小）,
        winners, losers, testnet}
     撈不到任何 income → symbols 為空、各項為 0。"""
     if d is None:
@@ -252,6 +268,22 @@ async def daily_pnl(d: _date | None = None) -> dict:
     for acc in by_symbol.values():
         acc["net"] = acc["realized"] + acc["commission"] + acc["funding"]
         symbols.append(acc)
+
+    if min_margin is not None or max_margin is not None:
+        for s in symbols:
+            if s["symbol"] != "—":
+                s["margin"] = await _entry_margin(s["symbol"], start_ms, end_ms)
+
+        def _keep(s: dict) -> bool:
+            m = s.get("margin", 0.0)
+            if min_margin is not None and not m > min_margin:
+                return False
+            if max_margin is not None and not m <= max_margin:
+                return False
+            return True
+
+        symbols = [s for s in symbols if _keep(s)]
+
     symbols.sort(key=lambda s: s["net"], reverse=True)
 
     return {
@@ -260,6 +292,8 @@ async def daily_pnl(d: _date | None = None) -> dict:
         "realized": sum(s["realized"] for s in symbols),
         "commission": sum(s["commission"] for s in symbols),
         "funding": sum(s["funding"] for s in symbols),
+        "min_margin": min_margin,
+        "max_margin": max_margin,
         "symbols": symbols,
         "winners": [s for s in symbols if s["net"] > 0],
         "losers": [s for s in symbols if s["net"] < 0],
