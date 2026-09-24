@@ -387,6 +387,107 @@ async def scenario_max_hold_not_expired():
     check("維持 ACTIVE", trades.get(tid)["status"] == "ACTIVE")
 
 
+def _reversed_signal():
+    """用 main._reverse_signal 翻出反向單：原訊號做多 entry 100、TP1 101、SL1 95
+    → 反向做空 entry 100、TP 95（全平）、SL 101。"""
+    import main
+    return main._reverse_signal({**SIGNAL, "side": "LONG"})
+
+
+async def scenario_reverse_signal_transform():
+    print("\n[反向-1] 訊號翻轉：做多 → 做空，TP=原 SL1、SL=原 TP1；方向不合理回 None")
+    import main
+    rev = _reversed_signal()
+    check("方向 SHORT 且標記 reversed", rev["side"] == "SHORT" and rev["reversed"] is True)
+    check("只有一個止盈 = 原 SL1 95", [t["price"] for t in rev["targets"]] == [95.0])
+    check("止損 = 原 TP1 101", [s["price"] for s in rev["stops"]] == [101.0])
+    check("不帶 source_stops（避免原始止損模式誤用順向止損）", "source_stops" not in rev)
+    bad = {**SIGNAL, "stops": [{"level": 1, "price": 105.0, "pct": 0}]}  # 止損在進場價上方＝不合理
+    check("價位方向不合理 → None 不下單", main._reverse_signal(bad) is None)
+
+
+async def scenario_reverse_entry_and_protection():
+    print("\n[反向-2] 反向單進場：SELL 限價、1 張 BUY 止盈全平 @95、1 張 BUY 止損 @101（不套 5% 上限）")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient()
+    bt._filters_cache.clear()
+    await bt.on_signal(_reversed_signal())
+    await asyncio.sleep(0.2)
+    entries = [c for c in fake.created if c.get("type") == "LIMIT"]
+    tps = [c for c in fake.created if c.get("type") == "TAKE_PROFIT_MARKET"]
+    sls = [c for c in fake.created if c.get("type") == "STOP_MARKET"]
+    check("進場是 SELL（開空）", len(entries) == 1 and entries[0]["side"] == "SELL")
+    check("只有 1 張止盈、BUY、@95", len(tps) == 1 and tps[0]["side"] == "BUY"
+          and tps[0]["stopPrice"] == "95.00")
+    check("止盈數量 = 全部倉位", tps[0]["quantity"] == entries[0]["quantity"])
+    check("只有 1 張止損（兩軌同價不拆半倉）、BUY、@101", len(sls) == 1
+          and sls[0]["side"] == "BUY" and sls[0]["stopPrice"] == "101.00")
+    check("止損數量 = 全部倉位", sls[0]["quantity"] == entries[0]["quantity"])
+    t = trades.list_status("ACTIVE")[-1]
+    check("DB 記下方向 SHORT", t["signal"]["side"] == "SHORT" and bt._side_of(t) == "SHORT")
+
+
+async def scenario_reverse_sl_failsafe():
+    print("\n[反向-3] 做空單：價格漲破止損 101 → 保險絲 BUY 市價平空")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="102")
+    bt._filters_cache.clear()
+    bt.SL_FAILSAFE = True
+    await bt.on_signal(_reversed_signal())
+    await asyncio.sleep(0.2)
+    tid = trades.list_status("ACTIVE")[-1]["id"]
+    fake.position_amt = "0.3"
+    fake.created.clear()
+    await bt._reconcile(trades.get(tid))
+    closes = [c for c in fake.created if c.get("type") == "MARKET" and c.get("reduceOnly") == "true"]
+    check("有送出市價平倉單", len(closes) == 1)
+    check("方向是 BUY（平空）", closes[0]["side"] == "BUY")
+    check("交易標記 CLOSED", trades.get(tid)["status"] == "CLOSED")
+
+
+async def scenario_reverse_no_false_trigger():
+    print("\n[反向-4] 做空單：價格下跌到 97（對空單有利、未達止盈 95）→ 保險絲不可誤平")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="97")
+    bt._filters_cache.clear()
+    await bt.on_signal(_reversed_signal())
+    await asyncio.sleep(0.2)
+    tid = trades.list_status("ACTIVE")[-1]["id"]
+    fake.position_amt = "0.3"
+    fake.created.clear()
+    await bt._reconcile(trades.get(tid))
+    check("沒有送出任何平倉單", not [c for c in fake.created if c.get("type") == "MARKET"])
+    check("交易仍 ACTIVE", trades.get(tid)["status"] == "ACTIVE")
+
+
+async def scenario_reverse_tp_failsafe():
+    print("\n[反向-5] 做空單：價格跌到 94（已過止盈 95 但條件單未成交）→ 保險絲 BUY 補平")
+    trades.DB_FILE = tempfile.mktemp(suffix=".db")
+    trades.init()
+    fake = bt._client = FakeFuturesClient(price="94")
+    bt._filters_cache.clear()
+    bt.TP_FAILSAFE = True
+    await bt.on_signal(_reversed_signal())
+    await asyncio.sleep(0.2)
+    tid = trades.list_status("ACTIVE")[-1]["id"]
+    fake.position_amt = "0.3"
+    fake.created.clear()
+    await bt._reconcile(trades.get(tid))
+    closes = [c for c in fake.created if c.get("type") == "MARKET"]
+    check("有補平單且方向 BUY", len(closes) == 1 and closes[0]["side"] == "BUY")
+
+
+async def scenario_legacy_trade_defaults_long():
+    print("\n[反向-6] 舊交易（signal 沒有 side 欄位）→ 仍當做多管理，不受反向功能影響")
+    legacy = {"signal": {k: v for k, v in SIGNAL.items() if k != "side"}}
+    check("沒有 side → LONG", bt._side_of(legacy) == "LONG")
+    check("做多止損判斷不變：跌破才算", bt._stop_breached(94, 95, bt._side_of(legacy))
+          and not bt._stop_breached(96, 95, bt._side_of(legacy)))
+
+
 async def main():
     trades.DB_FILE = tempfile.mktemp(suffix=".db")
     trades.init()
@@ -410,6 +511,15 @@ async def main():
     await scenario_raw_signal_mode()
     await scenario_max_hold_timeout()
     await scenario_max_hold_not_expired()
+    # 反向下單（依聊天室）
+    bt.RAW_SIGNAL_MODE = False
+    bt.SL1_PCT = 0.5  # 故意設很小：驗證反向單止損仍用原訊號 TP1（+1%），不被上限改掉
+    await scenario_reverse_signal_transform()
+    await scenario_reverse_entry_and_protection()
+    await scenario_reverse_sl_failsafe()
+    await scenario_reverse_no_false_trigger()
+    await scenario_reverse_tp_failsafe()
+    await scenario_legacy_trade_defaults_long()
     print("\n🎉 合約交易邏輯測試全部通過")
 
 

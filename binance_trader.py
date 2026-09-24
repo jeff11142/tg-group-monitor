@@ -82,16 +82,32 @@ MAX_HOLD_HOURS = float(_get("MAX_HOLD_HOURS", "24"))
 FUTURES = _get("BINANCE_FUTURES", "0") == "1"
 LEVERAGE = int(_get("LEVERAGE", "1"))
 MARGIN_TYPE = _get("MARGIN_TYPE", "ISOLATED").upper()
-TRADE_SIDE = _get("TRADE_SIDE", "LONG").upper()  # 預留做空；目前只用 LONG
+# 預設方向：訊號沒帶 side 時用這個。個別聊天室開反向下單時，main.py 會把 signal["side"] 設成相反方向
+TRADE_SIDE = _get("TRADE_SIDE", "LONG").upper()
 # 止損保險絲：對帳時若價格已穿過止損價但倉位還在（交易所條件單失靈）就主動市價平倉
 SL_FAILSAFE = _get("SL_FAILSAFE", "1") == "1"
 # 止盈保險絲：對帳時若價格已穿過某段止盈但該段還掛著沒成交，就逐段市價補平那一段
 TP_FAILSAFE = _get("TP_FAILSAFE", "1") == "1"
 
 
-def _sides() -> tuple[str, str]:
-    """回傳 (進場方向, 平倉方向)。LONG=BUY/SELL；SHORT=SELL/BUY（合約才支援）。"""
-    if TRADE_SIDE == "SHORT":
+def _side_of(obj: dict | None) -> str:
+    """取某筆交易或訊號的方向（LONG / SHORT）。
+
+    為什麼方向要跟著每筆交易走、不能只看全域 TRADE_SIDE：反向下單是「依聊天室」設定，
+    同一時間可能有做多單與做空單並存；且切換反向只套用新訊號，既有倉位必須照開倉當時的方向管理
+    （否則止損/保險絲判斷會整個顛倒）。方向存在 signal["side"]，signal 本來就以 JSON 存進 trades.db，
+    所以不必改 DB 結構；舊交易沒有這個欄位 → 退回全域 TRADE_SIDE（預設 LONG），行為與改版前相同。
+    obj 可傳 trade（含 "signal" 鍵）或 signal 本身。"""
+    if not obj:
+        return TRADE_SIDE
+    sig = obj["signal"] if isinstance(obj.get("signal"), dict) else obj
+    return str(sig.get("side") or TRADE_SIDE).upper()
+
+
+def _sides(side: str | None = None) -> tuple[str, str]:
+    """回傳 (進場方向, 平倉方向)。LONG=BUY/SELL；SHORT=SELL/BUY（合約才支援）。
+    side 省略時用全域 TRADE_SIDE（相容舊呼叫與測試）。"""
+    if (side or TRADE_SIDE) == "SHORT":
         return "SELL", "BUY"
     return "BUY", "SELL"
 
@@ -157,9 +173,10 @@ def _position_age_hours(trade: dict) -> float | None:
     return (datetime.now(timezone.utc) - created).total_seconds() / 3600
 
 
-def _pnl(entry: float, exit_price: float, qty: float) -> tuple[float, float, float]:
+def _pnl(entry: float, exit_price: float, qty: float,
+         side: str | None = None) -> tuple[float, float, float]:
     """估算平倉盈虧，回 (USDT 盈虧, 價格變動%, 報酬率% 含槓桿)。做空反向；未計手續費。"""
-    direction = -1 if TRADE_SIDE == "SHORT" else 1
+    direction = -1 if (side or TRADE_SIDE) == "SHORT" else 1
     move_pct = (exit_price - entry) / entry * 100 * direction if entry else 0.0
     pnl_usdt = (exit_price - entry) * qty * direction
     return pnl_usdt, move_pct, move_pct * LEVERAGE
@@ -309,6 +326,7 @@ def init() -> None:
     _client = Client(API_KEY, API_SECRET, testnet=TESTNET)
     trades.init()
     net = "TESTNET 測試網" if TESTNET else "⚠️ 正式網（真錢）"
+    # 顯示的是「預設方向」；個別聊天室開了反向下單時，該聊天室的訊號會反過來開倉
     market = f"合約 {LEVERAGE}x {MARGIN_TYPE} {TRADE_SIDE}" if FUTURES else "現貨 LONG"
     if AUTO_MIN_AMOUNT:
         amount_desc = "依交易對自動取最小"
@@ -406,6 +424,11 @@ async def _on_signal(signal: dict) -> None:
     if not (symbol and entry and targets and stops):
         print(f"[trader] 訊號缺必要欄位（symbol/entry/targets/stops），略過：{symbol}")
         return
+    side = _side_of(signal)
+    if side == "SHORT" and not FUTURES:
+        # 現貨無法做空（沒有借幣），反向訊號只能在合約模式下單
+        print(f"[trader] {symbol} 為做空（反向）訊號，但目前是現貨模式無法做空，略過")
+        return
 
     # 進場鎖：序列化額度檢查與下單，避免多訊號並發時超開
     async with _entry_lock:
@@ -453,18 +476,23 @@ async def _on_signal(signal: dict) -> None:
                       f"請調高 TRADE_USDT，略過")
                 return
 
-        order = await _open_entry(symbol, qty, price, filt)
+        # 把方向寫進 signal 再存檔：之後的保護單、對帳、保險絲、重啟回復都從這裡讀方向。
+        # 用複本而非直接改呼叫端的 dict，避免同一則訊號的廣播/記錄被交易模組的欄位污染。
+        signal = {**signal, "side": side}
+        order = await _open_entry(symbol, qty, price, filt, side)
         buy_id = order["orderId"]
         tid = trades.add(symbol=symbol, entry=float(price), qty=float(qty),
                          buy_order_id=buy_id, signal=signal)
-        print(f"[trader] {symbol} 限價{('合約' if FUTURES else '')}進場單已掛 @ {price}"
+        side_tag = f"{'做空' if side == 'SHORT' else '做多'}{'・反向' if signal.get('reversed') else ''}"
+        print(f"[trader] {symbol} 限價{('合約' if FUTURES else '')}進場單已掛（{side_tag}）@ {price}"
               f"（qty={qty}，trade#{tid}），等待成交…")
         _spawn(_watch_and_protect(tid, order.get("status", "")))
 
 
-async def _open_entry(symbol: str, qty: Decimal, price: Decimal, filt: dict) -> dict:
-    """下進場限價單；合約會先設好槓桿與保證金模式。"""
-    entry_side, _ = _sides()
+async def _open_entry(symbol: str, qty: Decimal, price: Decimal, filt: dict,
+                      side: str | None = None) -> dict:
+    """下進場限價單；合約會先設好槓桿與保證金模式。side=LONG/SHORT（省略用全域預設）。"""
+    entry_side, _ = _sides(side)
     if FUTURES:
         await _api(_client.futures_change_leverage, symbol=symbol, leverage=LEVERAGE)
         try:
@@ -673,7 +701,8 @@ async def _place_protection_futures(trade: dict) -> bool:
     signal = trade["signal"]
     filt = await _get_filters(symbol)
     targets = signal["targets"]
-    _, close_side = _sides()
+    side = _side_of(trade)
+    _, close_side = _sides(side)
 
     # 先確認真的有持倉才掛保護（重啟回復/延遲時，倉位可能已被平掉或從未開成）
     pos = await _api(_client.futures_position_information, symbol=symbol)
@@ -690,8 +719,10 @@ async def _place_protection_futures(trade: dict) -> bool:
     # 止損：初始（tier 0）掛 rung[1]=SL1。SL2_MULT>0 → 雙軌（上軌 SL1、下軌 SL2 各半倉）；
     # SL2_MULT=0 → 單軌守全倉（捨棄 SL2）。
     rungs = _sl_ladder(signal)
+    # 兩軌同價（反向單 SL1=SL2=原訊號 TP1）時掛兩張半倉沒有意義，直接單張守全倉
     sl_ids, sl_prices = await _place_dual_sls(symbol, rungs[1], rungs[0], amt, filt,
-                                              dual=SL2_MULT > 0)
+                                              dual=SL2_MULT > 0 and rungs[0] != rungs[1],
+                                              side=side)
 
     # 進場即穿所有止損：每道 SL 都被 -2021 拒、已逐腿市價平倉，倉位已了結（沒掛上單、也沒交保險絲的價）。
     # 不再掛 TP（避免留下對應已平倉位的裸 TP 單），直接收單，不留 ACTIVE 裸倉。
@@ -1009,8 +1040,9 @@ async def _reconcile_futures(trade: dict, snap: dict | None = None) -> None:
 
     # 止損保險絲：價格穿過「最深的那道止損」但倉位還在 → 主動市價「全平」兜底
     if SL_FAILSAFE and sl_prices and price > 0:
-        deepest = max(sl_prices) if TRADE_SIDE == "SHORT" else min(sl_prices)
-        if _stop_breached(price, deepest):
+        side = _side_of(trade)
+        deepest = max(sl_prices) if side == "SHORT" else min(sl_prices)
+        if _stop_breached(price, deepest, side):
             await _force_close_futures(trade, amt, price, deepest)
             return
 
@@ -1024,9 +1056,9 @@ async def _reconcile_futures(trade: dict, snap: dict | None = None) -> None:
         await _update_dual_sl_futures(trade, info, amt, snap)
 
 
-def _tp_breached(price: float, tp_price: float) -> bool:
+def _tp_breached(price: float, tp_price: float, side: str | None = None) -> bool:
     """價格是否已達止盈：做多 = 漲到；做空 = 跌到。"""
-    if TRADE_SIDE == "SHORT":
+    if (side or TRADE_SIDE) == "SHORT":
         return price <= tp_price
     return price >= tp_price
 
@@ -1035,7 +1067,8 @@ async def _tp_failsafe_futures(trade: dict, info: dict, price: float,
                                snap: dict | None = None) -> bool:
     """逐段檢查：某段 TP 條件單還掛著、但價格已達該 TP → 市價補平那一段。回傳是否有動作。"""
     symbol = trade["symbol"]
-    _, close_side = _sides()
+    side = _side_of(trade)
+    _, close_side = _sides(side)
     filt = await _get_filters(symbol)
     if snap is not None:
         open_ids = snap["open_cond_ids"]
@@ -1047,7 +1080,7 @@ async def _tp_failsafe_futures(trade: dict, info: dict, price: float,
     for tp in info.get("tp_orders") or []:
         if tp.get("order_id") not in open_ids:
             continue  # 該段已成交或已取消
-        if not _tp_breached(price, float(tp["tp"])):
+        if not _tp_breached(price, float(tp["tp"]), side):
             continue
         # 先撤掉該段 TP 條件單（避免等下又自己觸發重複賣），再市價補平該段數量
         await _cancel_conditional(symbol, tp["order_id"])
@@ -1064,28 +1097,30 @@ async def _tp_failsafe_futures(trade: dict, info: dict, price: float,
     return acted
 
 
-def _stop_breached(price: float, sl_price: float) -> bool:
+def _stop_breached(price: float, sl_price: float, side: str | None = None) -> bool:
     """價格是否已穿過止損：做多 = 跌破；做空 = 漲破。"""
-    if TRADE_SIDE == "SHORT":
+    if (side or TRADE_SIDE) == "SHORT":
         return price >= sl_price
     return price <= sl_price
 
 
-def _net_breakeven_price(entry: Decimal) -> Decimal:
+def _net_breakeven_price(entry: Decimal, side: str | None = None) -> Decimal:
     """淨保本價：把來回手續費算進去，移動後即使被掃也不虧。做多往上加、做空往下減。"""
     bump = Decimal(str(BREAKEVEN_FEE_PCT)) / Decimal("100")
-    return entry * (Decimal(1) - bump) if TRADE_SIDE == "SHORT" else entry * (Decimal(1) + bump)
+    if (side or TRADE_SIDE) == "SHORT":
+        return entry * (Decimal(1) - bump)
+    return entry * (Decimal(1) + bump)
 
 
-def _sl_safe_side(target: float, price: float) -> bool:
+def _sl_safe_side(target: float, price: float, side: str | None = None) -> bool:
     """新止損是否在市價的安全側（做多：低於市價；做空：高於市價），避免一掛就立刻觸發。"""
-    return target > price if TRADE_SIDE == "SHORT" else target < price
+    return target > price if (side or TRADE_SIDE) == "SHORT" else target < price
 
 
 async def _force_close_futures(trade: dict, amt: float, price: float, sl_price: float) -> None:
     """保險絲：條件單沒觸發時，主動市價平掉整個倉位、撤殘留單、標記 CLOSED。"""
     symbol = trade["symbol"]
-    _, close_side = _sides()
+    _, close_side = _sides(_side_of(trade))
     filt = await _get_filters(symbol)
     qty = _quantize(amt, filt["step"])
     print(f"[trader] ⚠️ trade#{trade['id']} {symbol} 現價 {price} 已穿過止損 {sl_price}，"
@@ -1106,7 +1141,8 @@ async def _force_close_futures(trade: dict, amt: float, price: float, sl_price: 
 async def _close_stale_futures(trade: dict, amt: float, age_h: float) -> None:
     """持倉超過 MAX_HOLD_HOURS 仍未觸發 TP/SL：主動市價全平、撤殘留單、標 CLOSED，並通知管理員（含真實盈虧）。"""
     symbol = trade["symbol"]
-    _, close_side = _sides()
+    side = _side_of(trade)
+    _, close_side = _sides(side)
     filt = await _get_filters(symbol)
     qty = _quantize(amt, filt["step"])
     # 真實進場均價（供報酬率/顯示）；取不到退回記錄的進場價
@@ -1149,7 +1185,7 @@ async def _close_stale_futures(trade: dict, amt: float, age_h: float) -> None:
         )
         log_pnl = f"{sign}{net:.2f} USDT / {sign}{roe:.2f}%（真實，含費）"
     else:
-        pnl_usdt, _, roe_pct = _pnl(real_entry, exit_price, float(amt))
+        pnl_usdt, _, roe_pct = _pnl(real_entry, exit_price, float(amt), side)
         emoji, sign = ("📈", "+") if pnl_usdt >= 0 else ("📉", "")
         pnl_line = (f"{emoji} 盈虧：約 {sign}{pnl_usdt:.2f} USDT"
                     f"（報酬率 {sign}{roe_pct:.2f}%，含 {LEVERAGE:g}x 槓桿；估算、未含手續費）")
@@ -1183,7 +1219,10 @@ def _signal_sl1_pct(signal: dict) -> float | None:
         return None
     entry = float(signal["entry"])
     sl1 = float(stops[0]["price"])
-    pct = (sl1 - entry) / entry * 100 if TRADE_SIDE == "SHORT" else (entry - sl1) / entry * 100
+    if _side_of(signal) == "SHORT":
+        pct = (sl1 - entry) / entry * 100
+    else:
+        pct = (entry - sl1) / entry * 100
     return pct if pct > 0 else None
 
 
@@ -1200,7 +1239,10 @@ def effective_sl1(signal: dict) -> dict:
     回 {level, price, pct}，價格與下單上軌一致；僅供顯示，未依交易對 tick 取整。"""
     entry = float(signal["entry"])
     sl1_pct, _ = _effective_sl_pcts(signal)
-    price = entry * (1 + sl1_pct / 100) if TRADE_SIDE == "SHORT" else entry * (1 - sl1_pct / 100)
+    if _side_of(signal) == "SHORT":
+        price = entry * (1 + sl1_pct / 100)
+    else:
+        price = entry * (1 - sl1_pct / 100)
     return {"level": 1, "price": round(price, 8), "pct": round((price - entry) / entry * 100, 2)}
 
 
@@ -1222,28 +1264,34 @@ def _sl_ladder(signal: dict) -> list[float]:
     原始訊號模式（RAW_SIGNAL_MODE）：SL1/SL2 直接用訊號給的價位。
     雙軌取相鄰兩階：下軌=rung[tier]、上軌=rung[tier+1]（tier=已成交TP數）。"""
     entry = Decimal(str(signal["entry"]))
-    raw = _raw_signal_stops(signal) if RAW_SIGNAL_MODE else None
+    side = _side_of(signal)
+    # 反向單一律照訊號給的價位（=原訊號 TP1）當止損、不套 SL1_PCT 上限：
+    # 使用者定義反向的止損就是「原訊號第一個止盈點」，上限重算會讓止損偏離這個定義。
+    use_raw = RAW_SIGNAL_MODE or signal.get("reversed")
+    raw = _raw_signal_stops(signal) if use_raw else None
     if raw is not None:
-        sl2, sl1 = raw                                           # 原始訊號：照訊號 SL1/SL2
+        sl2, sl1 = raw                                           # 原始訊號／反向：照訊號價位
     else:
         sl1_pct, sl2_pct = _effective_sl_pcts(signal)
         p1 = Decimal(str(sl1_pct)) / 100
         p2 = Decimal(str(sl2_pct)) / 100
-        if TRADE_SIDE == "SHORT":
+        if side == "SHORT":
             sl2, sl1 = entry * (1 + p2), entry * (1 + p1)         # 做空：止損在上方
         else:
             sl2, sl1 = entry * (1 - p2), entry * (1 - p1)         # 做多：止損在下方
-    rungs = [float(sl2), float(sl1), float(_net_breakeven_price(entry))]
+    rungs = [float(sl2), float(sl1), float(_net_breakeven_price(entry, side))]
     rungs.extend(float(t["price"]) for t in signal["targets"])    # TP1..TPn
     return rungs
 
 
 async def _place_dual_sls(symbol: str, sl_hi: float, sl_lo: float,
-                          remaining: float, filt: dict, dual: bool = True) -> tuple[list, list]:
+                          remaining: float, filt: dict, dual: bool = True,
+                          side: str | None = None) -> tuple[list, list]:
     """掛 reduceOnly 止損。dual=True：雙軌半倉（上軌 sl_hi、下軌 sl_lo 各半）；
     dual=False：單軌守全倉（只掛 sl_hi）。回傳 (order_ids, prices)。
-    某段已穿價(-2021)就市價平該段；雙軌倉位太小無法對半→退回單張守全部剩餘。"""
-    _, close_side = _sides()
+    某段已穿價(-2021)就市價平該段；雙軌倉位太小無法對半→退回單張守全部剩餘。
+    side=這筆交易的方向（決定平倉用 BUY 還是 SELL）。"""
+    _, close_side = _sides(side)
     min_qty = float(filt["min_qty"])
     hi = _quantize(sl_hi, filt["tick"])
     lo = _quantize(sl_lo, filt["tick"])
@@ -1325,7 +1373,8 @@ async def _update_dual_sl_futures(trade: dict, info: dict, amt: float,
         else:
             ticker = await _api(_client.futures_symbol_ticker, symbol=symbol)
             price = float(ticker["price"])
-        if price <= 0 or not _sl_safe_side(float(sl_hi), price):
+        side = _side_of(trade)
+        if price <= 0 or not _sl_safe_side(float(sl_hi), price, side):
             return  # 上軌已不在市價安全側（設了會立刻觸發）→ 等下一次再試
 
         # 撤掉舊的兩道止損（含相容舊版單張 sl_order_id）
@@ -1334,7 +1383,7 @@ async def _update_dual_sl_futures(trade: dict, info: dict, amt: float,
         await _cancel_conditional(symbol, info.get("sl_order_id"))
 
         sl_ids, sl_prices = await _place_dual_sls(symbol, float(sl_hi), float(sl_lo), amt, filt,
-                                                  dual=SL2_MULT > 0)
+                                                  dual=SL2_MULT > 0 and sl_hi != sl_lo, side=side)
         info["sl_orders"] = sl_ids
         info["sl_prices"] = sl_prices
         info.pop("sl_order_id", None)

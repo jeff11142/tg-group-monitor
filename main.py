@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from dotenv import load_dotenv
-from telethon import Button, TelegramClient, events
+from telethon import Button, TelegramClient, events, utils
 
 import recipients
 import signal_store
@@ -28,6 +28,17 @@ def _get(name: str, default: str = "") -> str:
 
 
 _http: "httpx.AsyncClient | None" = None  # 供 bot 指令處理共用的 HTTP client
+
+# 監聽來源（多聊天室）的 runtime 狀態。
+# 為什麼用可變 set 而不是 events.NewMessage(chats=...)：chats= 在註冊 handler 時就固定，
+# 之後要增減聊天室只能重啟服務；改成 handler 內比對這個 set，/sources 增減後立即生效、不用重啟。
+_user_client: "TelegramClient | None" = None  # 個人帳號 client（/sources 列對話清單要用）
+_source_ids: set[int] = set()                  # 監聽中的聊天室 peer id（與 event.chat_id 同格式，如 -100xxxx）
+_source_names: dict[int, str] = {}             # peer id → 顯示名稱（面板用）
+# 開啟「反向下單」的聊天室 peer id（.env REVERSE_CHATS，逗號分隔）。
+# 為什麼獨立一個 key 而不塞進 SOURCE_CHAT：SOURCE_CHAT 維持純 id 清單，舊設定與 LIST_DIALOGS 流程不受影響。
+_reverse_ids: set[int] = {int(v) for v in _get("REVERSE_CHATS").split(",")
+                          if v.strip().lstrip("-").isdigit()}
 
 
 API_ID = _get("API_ID")
@@ -64,6 +75,11 @@ def _parse_chat(value: str):
         return int(value)
     except ValueError:
         return value  # @username 或邀請連結
+
+
+def _parse_chats(value: str) -> list:
+    """SOURCE_CHAT 支援逗號分隔多個聊天室（沿用原 key 名，舊的單一值設定不用改就相容）。"""
+    return [c for c in (_parse_chat(v.strip()) for v in value.split(",")) if c is not None]
 
 
 def _matches(text: str) -> bool:
@@ -148,6 +164,45 @@ def parse_signal(text: str) -> dict | None:
             "pct": round((price - entry) / entry * 100, 2),
         })
     return signal
+
+
+def _reverse_signal(signal: dict) -> dict | None:
+    """把訊號翻成「反向單」給交易模組下單（只給下單用；廣播給訂閱者的仍是原訊號）。
+
+    規則（使用者定義）：
+    - 方向相反（訊號做多 → 我們做空）
+    - 止盈只有一個、全部平倉：價位 = 原本順向單會掛的止損（signal["stops"][0]，
+      也就是已套過 SL1_PCT 上限的自算 SL1；原始訊號模式下則是訊號原始 SL1）
+    - 止損 = 原訊號的 TP1（交易模組對 reversed 訊號不再套 SL1_PCT 上限）
+    刻意不帶 source_stops：交易模組的原始止損模式會優先讀它，帶了會誤用順向單的止損價。
+    價位方向不合理（例如 TP 沒在進場價的獲利側）就回 None，寧可不下單。"""
+    stops = signal.get("stops") or []
+    targets = sorted(signal.get("targets") or [], key=lambda t: t["level"])
+    if not stops or not targets:
+        return None
+    entry = float(signal["entry"])
+    tp = float(stops[0]["price"])
+    sl = float(targets[0]["price"])
+    side = "LONG" if str(signal.get("side") or "LONG").upper() == "SHORT" else "SHORT"
+    ok = (sl > entry > tp) if side == "SHORT" else (sl < entry < tp)
+    if not ok:
+        print(f"[反向] {signal.get('symbol')} 價位方向不合理（entry={entry} TP={tp} SL={sl}），不下單")
+        return None
+
+    def _pct(p: float) -> float:
+        return round((p - entry) / entry * 100, 2)
+
+    return {
+        "symbol": signal["symbol"],
+        "entry": entry,
+        "targets": [{"level": 1, "price": tp, "pct": _pct(tp)}],
+        "stops": [{"level": 1, "price": sl, "pct": _pct(sl)}],
+        "side": side,
+        "reversed": True,
+        # 留底原訊號價位，事後查單/稽核時能對照反向前後
+        "original": {"targets": signal.get("targets"), "stops": signal.get("stops"),
+                     "source_stops": signal.get("source_stops")},
+    }
 
 
 def _our_sl1(signal: dict) -> dict | None:
@@ -317,6 +372,7 @@ ADMIN_COMMANDS = [
     {"command": "list", "description": "列出所有接收者"},
     {"command": "config", "description": "查看或調整交易參數"},
     {"command": "pnl", "description": "查某天實際損益（選手動／量化交易）"},
+    {"command": "sources", "description": "管理監聽的聊天室（新增／移除）"},
     {"command": "myid", "description": "顯示你的編號"},
     {"command": "help", "description": "顯示管理說明"},
 ]
@@ -487,6 +543,7 @@ ADMIN_HELP_TEXT = (
     "/disable — 暫停接收者\n"
     "/config — 查看或調整交易參數\n"
     "/pnl — 查某天實際損益（點擊後選手動／量化交易 → 選日期，含今日／昨日快捷）\n"
+    "/sources — 管理監聽的聊天室（可同時監聽多個、各自開關反向下單，即時生效免重啟）\n"
     "/cancel — 取消進行中的操作\n"
     "/myid — 顯示你的編號\n"
     "/help — 顯示此說明"
@@ -830,9 +887,103 @@ async def _handle_pnl(event) -> None:
     await event.reply("📊 查詢實際損益\n請選擇交易類型：", buttons=_pnl_mode_buttons())
 
 
+# ===== 監聽聊天室管理（/sources）=====
+# 新增面板最多列幾個候選對話（TG inline 鍵盤上限 100 顆，留餘裕也避免訊息過長）
+_SOURCE_DIALOG_LIMIT = 40
+
+
+async def _resolve_sources(client: TelegramClient, values: list) -> None:
+    """把 SOURCE_CHAT 的設定值轉成 peer id 放進 _source_ids，並盡量取得顯示名稱。
+
+    為什麼數字 ID 解析失敗仍照樣加入：handler 只拿 event.chat_id 比對這個 set，
+    不需要 entity；新 session 的 entity 快取是空的，get_entity 常失敗，不能因此漏監聽。
+    @username 則必須解析成功才知道 id，失敗只能略過並印警告。"""
+    dialogs_loaded = False
+    for v in values:
+        ent = None
+        for attempt in range(2):
+            try:
+                ent = await client.get_entity(v)
+                break
+            except (ValueError, TypeError):
+                # 快取沒有這個 entity → 抓一次對話清單把快取灌滿再重試（只做一次，避免拖慢啟動）
+                if attempt == 0 and not dialogs_loaded:
+                    await client.get_dialogs()
+                    dialogs_loaded = True
+                    continue
+                break
+            except Exception as e:
+                print(f"[來源] 解析 {v!r} 失敗：{e}")
+                break
+        if ent is not None:
+            pid = utils.get_peer_id(ent)
+            _source_ids.add(pid)
+            _source_names[pid] = (getattr(ent, "title", None)
+                                  or getattr(ent, "first_name", None) or str(pid))
+        elif isinstance(v, int):
+            _source_ids.add(v)
+            _source_names.setdefault(v, str(v))
+        else:
+            print(f"[來源] 找不到 {v!r}（帳號可能沒加入該群組），略過")
+
+
+def _persist_sources() -> None:
+    """寫回 .env 的 SOURCE_CHAT（逗號分隔的數字 id），重啟後維持同一組監聽聊天室。
+    同時清掉已不在監聽清單的反向設定並寫回 REVERSE_CHATS，避免之後重新加回時意外沿用舊的反向狀態。"""
+    _update_env_file("SOURCE_CHAT", ",".join(str(i) for i in sorted(_source_ids)))
+    _reverse_ids.intersection_update(_source_ids)
+    _persist_reverse()
+
+
+def _persist_reverse() -> None:
+    """寫回 .env 的 REVERSE_CHATS，重啟後維持各聊天室的反向設定。"""
+    _update_env_file("REVERSE_CHATS", ",".join(str(i) for i in sorted(_reverse_ids)))
+
+
+def _sources_panel() -> tuple[str, list]:
+    """/sources 主面板：列出監聽中的聊天室（各附移除鈕、反向開關）＋新增鈕。"""
+    lines = [f"📡 目前監聽 {len(_source_ids)} 個聊天室"
+             "（每個聊天室解析到的進場訊號都會自動下單）："]
+    buttons = []
+    for pid in sorted(_source_ids):
+        name = _source_names.get(pid, str(pid))
+        rev = pid in _reverse_ids
+        lines.append(f"  • {name}（{pid}）{'｜🔁 反向下單' if rev else '｜順向'}")
+        buttons.append([
+            Button.inline(f"❌ 移除 {name}"[:40], f"srcdel:{pid}".encode()),
+            Button.inline("🔁 反向：開→關" if rev else "🔁 反向：關→開", f"srcrev:{pid}".encode()),
+        ])
+    buttons.append([Button.inline("➕ 新增聊天室", b"srcaddlist")])
+    buttons.append(_cancel_row())
+    return "\n".join(lines), buttons
+
+
+async def _source_candidates_panel() -> tuple[str, list]:
+    """列出個人帳號已加入、但尚未監聽的群組／頻道，點選即可新增。
+    只列已加入的：個人帳號沒加入的聊天室本來就收不到訊息，列了也沒用。"""
+    buttons = []
+    async for d in _user_client.iter_dialogs(limit=200):
+        if not (d.is_group or d.is_channel) or d.id in _source_ids:
+            continue
+        _source_names[d.id] = d.name  # 先快取名稱，確認新增時才有名字可顯示
+        kind = "群組" if d.is_group else "頻道"
+        buttons.append([Button.inline(f"[{kind}] {d.name}"[:60], f"srcadd:{d.id}".encode())])
+        if len(buttons) >= _SOURCE_DIALOG_LIMIT:
+            break
+    if not buttons:
+        return "沒有可新增的群組／頻道（已全部在監聽中，或帳號尚未加入其他群組）。", [_cancel_row()]
+    buttons.append(_cancel_row())
+    return f"請選擇要新增監聽的聊天室（依最近活動排序，最多列 {_SOURCE_DIALOG_LIMIT} 個）：", buttons
+
+
 async def _handle_admin_command(event, text: str) -> None:
     parts = text.split(None, 2)  # 切最多 3 段：cmd, arg1, rest
     cmd = parts[0].lower()
+
+    if cmd == "/sources":
+        msg, buttons = _sources_panel()
+        await event.reply(msg, buttons=buttons)
+        return
 
     if cmd == "/config":
         await _send_config_panel(event)
@@ -980,11 +1131,16 @@ async def main() -> None:
         await user_client.disconnect()
         return
 
-    source = _parse_chat(SOURCE_CHAT)
-    if source is None:
+    source_values = _parse_chats(SOURCE_CHAT)
+    if not source_values:
         raise SystemExit("未設定 SOURCE_CHAT（要監聽的群組）。先把 LIST_DIALOGS=1 跑一次找 id。")
 
-    global _http
+    global _http, _user_client
+    _user_client = user_client
+    await _resolve_sources(user_client, source_values)
+    if not _source_ids:
+        raise SystemExit(f"SOURCE_CHAT={SOURCE_CHAT!r} 沒有任何可監聽的聊天室，請檢查設定。")
+
     http = _http = httpx.AsyncClient(timeout=10)
 
     # 啟動 bot 客戶端（收 admin 指令、回覆非 admin）
@@ -1177,6 +1333,113 @@ async def main() -> None:
             await event.answer()
             await event.edit("已取消。")
 
+        @bot_client.on(events.CallbackQuery(pattern=b"srcaddlist"))
+        async def _on_source_add_list(event):
+            """/sources 的「新增聊天室」：列出可新增的群組／頻道。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            await event.answer()
+            msg, buttons = await _source_candidates_panel()
+            await event.edit(msg, buttons=buttons)
+
+        @bot_client.on(events.CallbackQuery(pattern=b"srcadd:"))
+        async def _on_source_add(event):
+            """選了候選聊天室 → 二次確認。
+            為什麼要確認：新增後該聊天室的訊號會直接自動下單（可能是正式網真錢），誤點代價高。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            await event.answer()
+            pid = int(event.data.decode().split(":", 1)[1])
+            name = _source_names.get(pid, str(pid))
+            net = ""
+            if trader is not None:
+                import binance_trader as bt
+                net = f"\n\n⚠️ 新增後此聊天室解析到的進場訊號會在「{bt.current_network()}」自動下單。"
+            await event.edit(
+                f"確認新增監聽「{name}」（{pid}）？{net}",
+                buttons=[[Button.inline("✅ 確認新增", f"srcaddok:{pid}".encode())], _cancel_row()],
+            )
+
+        @bot_client.on(events.CallbackQuery(pattern=b"srcaddok:"))
+        async def _on_source_add_confirm(event):
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            await event.answer()
+            pid = int(event.data.decode().split(":", 1)[1])
+            _source_ids.add(pid)
+            _persist_sources()
+            print(f"[來源] 新增監聽：{_source_names.get(pid, pid)}（{pid}）")
+            msg, buttons = _sources_panel()
+            await event.edit(f"✅ 已新增（已寫回 .env，重啟後維持）\n\n{msg}", buttons=buttons)
+
+        @bot_client.on(events.CallbackQuery(pattern=b"srcdel:"))
+        async def _on_source_delete(event):
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            pid = int(event.data.decode().split(":", 1)[1])
+            # 至少保留一個：全部移除的話服務還在跑卻什麼都沒監聽，容易誤以為正常、重啟時也會因沒設定而啟動失敗
+            if pid in _source_ids and len(_source_ids) == 1:
+                await event.answer("至少要保留一個監聽的聊天室", alert=True)
+                return
+            await event.answer()
+            _source_ids.discard(pid)
+            _persist_sources()
+            print(f"[來源] 移除監聽：{_source_names.get(pid, pid)}（{pid}）")
+            msg, buttons = _sources_panel()
+            await event.edit(f"✅ 已移除（已寫回 .env，重啟後維持）\n\n{msg}", buttons=buttons)
+
+        @bot_client.on(events.CallbackQuery(pattern=b"srcrev:"))
+        async def _on_source_reverse_toggle(event):
+            """切換某聊天室的反向下單。關→開要二次確認（會開始反向用真錢下單）；開→關直接生效。
+            只影響之後的新訊號：已開的倉位方向記在各自 trade 的 signal["side"]，照原方向管理到平倉。"""
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            await event.answer()
+            pid = int(event.data.decode().split(":", 1)[1])
+            name = _source_names.get(pid, str(pid))
+            if pid in _reverse_ids:
+                _reverse_ids.discard(pid)
+                _persist_reverse()
+                print(f"[來源] 關閉反向下單：{name}（{pid}）")
+                msg, buttons = _sources_panel()
+                await event.edit(f"✅ 「{name}」已改回順向（新訊號生效）\n\n{msg}", buttons=buttons)
+                return
+            net = ""
+            if trader is not None:
+                import binance_trader as bt
+                net = f"（{bt.current_network()}）"
+            await event.edit(
+                f"確認對「{name}」開啟反向下單？{net}\n\n"
+                "開啟後此聊天室的訊號會：\n"
+                "• 反方向開倉（訊號做多 → 我們做空）\n"
+                "• 止盈 = 原本的止損價，一次全部平倉\n"
+                "• 止損 = 原訊號 TP1\n"
+                "只影響之後的新訊號，已開倉位照原方向管理。",
+                buttons=[[Button.inline("✅ 確認開啟反向", f"srcrevok:{pid}".encode())],
+                         _cancel_row()],
+            )
+
+        @bot_client.on(events.CallbackQuery(pattern=b"srcrevok:"))
+        async def _on_source_reverse_confirm(event):
+            if event.sender_id != admin_id:
+                await event.answer("無權限", alert=True)
+                return
+            await event.answer()
+            pid = int(event.data.decode().split(":", 1)[1])
+            if pid not in _source_ids:
+                await event.edit("此聊天室已不在監聽清單，未變更。")
+                return
+            _reverse_ids.add(pid)
+            _persist_reverse()
+            print(f"[來源] 開啟反向下單：{_source_names.get(pid, pid)}（{pid}）")
+            msg, buttons = _sources_panel()
+            await event.edit(f"✅ 已開啟反向下單（新訊號生效，已寫回 .env）\n\n{msg}", buttons=buttons)
+
         @bot_client.on(events.CallbackQuery(pattern=b"netsw"))
         async def _on_net_switch(event):
             """/config 的「切換網路」按鈕：先做安全檢查，再要求二次確認（正式網加重警告）。"""
@@ -1303,12 +1566,14 @@ async def main() -> None:
         await trader.start_user_stream()
 
     bot_cmd_status = f"開（admin={admin_id}）" if bot_client else "關"
-    print(f"開始監聽：{SOURCE_CHAT}")
+    print("開始監聽：" + "、".join(
+        f"{_source_names.get(i, i)}（{i}）{'🔁反向' if i in _reverse_ids else ''}" for i in sorted(_source_ids)))
     print(f"關鍵字：{KEYWORDS or '（無，全部訊息）'}")
     print(f"Bot 轉發：{'開' if BOT_TOKEN else '關'} | Bot 指令：{bot_cmd_status} | Webhook：{'開' if WEBHOOK_URL else '關'}")
     print(f"接收者：{recipients.count()} 筆 | 自動交易：{'開' if trader else '關'}")
 
-    @user_client.on(events.NewMessage(chats=source))
+    # 不用 chats= 固定來源，改在 func 裡即時比對 _source_ids（/sources 增減後立即生效）
+    @user_client.on(events.NewMessage(func=lambda e: e.chat_id in _source_ids))
     async def handler(event: events.NewMessage.Event) -> None:
         text = event.message.message or ""
         if not _matches(text):
@@ -1379,7 +1644,15 @@ async def main() -> None:
             jobs.append(send_webhook(http, payload))
         # 只有「解析成功的進場訊號」才自動下單；目標達成通知不下單
         if trader is not None and signal is not None:
-            jobs.append(trader.on_signal(signal))
+            if event.chat_id in _reverse_ids:
+                # 反向下單：只有「下單」用翻轉後的訊號，廣播／webhook／訊號追蹤仍用原訊號
+                rev = _reverse_signal(signal)
+                if rev is not None:
+                    print(f"[反向] {rev['symbol']} {rev['side']} @ {rev['entry']}"
+                          f" TP={rev['targets'][0]['price']} SL={rev['stops'][0]['price']}")
+                    jobs.append(trader.on_signal(rev))
+            else:
+                jobs.append(trader.on_signal(signal))
         if jobs:
             await asyncio.gather(*jobs)
 

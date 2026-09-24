@@ -69,7 +69,8 @@ python main.py
 
 | 變數 | 說明 |
 |------|------|
-| `SOURCE_CHAT` | 要監聽的群組：@username、數字 ID（如 `-1001234567890`） |
+| `SOURCE_CHAT` | 要監聽的群組：@username、數字 ID（如 `-1001234567890`）；多個用逗號分隔。執行中可用 bot `/sources` 新增／移除（即時生效並寫回 `.env`） |
+| `REVERSE_CHATS` | 開啟反向下單的聊天室 id（逗號分隔）：訊號做多→做空，止盈＝原止損價（全平）、止損＝原訊號 TP1。可用 bot `/sources` 開關，只影響新訊號 |
 | `KEYWORDS` | 逗號分隔，包含任一即命中；**留空＝全部訊息** |
 | `BOT_TOKEN` | TG Bot token（@BotFather 申請）；命中訊息會用此 bot 廣播給接收者清單 |
 | `BOT_TARGET` | 第一次跑時自動加入接收者清單的「初始接收者」chat_id；之後動態管理請對 bot 用指令 |
